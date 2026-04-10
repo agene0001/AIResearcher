@@ -1,6 +1,6 @@
 # AIResearcher
 
-A zero-cost, local-first MCP (Model Context Protocol) server for academic paper research. Search, analyze, and synthesize research papers from 6 providers using free local AI models.
+A zero-cost, local-first MCP  server for academic paper research. Search, analyze, and synthesize research papers from 6 providers using free local AI models.
 
 ## Features
 
