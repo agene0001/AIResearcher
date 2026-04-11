@@ -72,8 +72,12 @@ impl HarrierEmbedder {
 fn init_embedder() -> Result<Mutex<HarrierEmbedder>> {
     eprintln!("Loading harrier-oss-v1-0.6b embedding model (first run downloads ~1.2GB)...");
 
-    // Try Metal with F32 — BF16 rms-norm is unsupported but F32 may work
+    #[cfg(feature = "cuda")]
+    let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
     let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    let device = Device::Cpu;
     let dtype = DType::F32;
 
     let api = Api::new().context("Failed to initialize HuggingFace Hub API")?;
