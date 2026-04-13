@@ -11,7 +11,7 @@ use crate::storage::postgres::DbClient;
 use crate::processing::embedding::{generate_embedding, generate_document_embedding};
 use crate::llm::client::{cheap_config, chat_completion};
 
-const PER_PROVIDER_LIMIT: usize = 10;
+const PER_PROVIDER_LIMIT: usize = 20;
 
 /// Use the cheap LLM to reformulate a natural language query into search-optimized keywords.
 /// For short keyword queries, returns them as-is.

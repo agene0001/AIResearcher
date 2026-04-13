@@ -16,3 +16,9 @@ pub async fn generate_document_embedding(text: &str) -> Result<Vec<f32>> {
     tokio::task::spawn_blocking(move || harrier::embed_document(&text))
         .await?
 }
+
+/// Generate embeddings for a batch of documents in a single forward pass.
+pub async fn generate_document_embeddings_batch(texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    tokio::task::spawn_blocking(move || harrier::embed_document_batch(&texts))
+        .await?
+}

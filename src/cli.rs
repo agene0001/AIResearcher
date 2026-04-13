@@ -42,6 +42,29 @@ pub enum Commands {
         output: Option<String>,
     },
 
+    /// Ingest papers from OpenAlex into the database
+    Ingest {
+        /// Ingestion source: "snapshot" (bulk download, faster) or "api" (no download, rate-limited)
+        #[arg(long, default_value = "snapshot")]
+        source: String,
+
+        /// Path to the OpenAlex snapshot directory (required for --source snapshot)
+        #[arg(long)]
+        snapshot_dir: Option<String>,
+
+        /// Minimum publication year to include (default: 2015)
+        #[arg(long, default_value = "2015")]
+        min_year: u32,
+
+        /// Batch size for embedding/insertion (default: 128)
+        #[arg(long, default_value = "128")]
+        batch_size: usize,
+
+        /// Max papers to ingest, 0 for unlimited (default: 0)
+        #[arg(long, default_value = "0")]
+        max_papers: usize,
+    },
+
     /// Test embedding speed with harrier-oss-v1-0.6b
     TestEmbedding,
 

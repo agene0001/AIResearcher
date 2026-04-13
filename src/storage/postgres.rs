@@ -149,6 +149,44 @@ impl DbClient {
         Ok(papers)
     }
 
+    /// Batch insert papers with embeddings. Much faster than individual inserts.
+    pub async fn insert_papers_batch(&self, papers: &[Paper], embeddings: &[Vec<f32>]) -> Result<()> {
+        if papers.is_empty() {
+            return Ok(());
+        }
+
+        // Use a transaction for atomicity and speed
+        let mut tx = self.pool.begin().await?;
+
+        for (paper, embedding) in papers.iter().zip(embeddings.iter()) {
+            let vector = Vector::from(embedding.clone());
+            let authors_json = serde_json::to_value(&paper.authors)?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO papers (id, title, abstract_text, content, source, year, doi, url, authors, embedding)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (id) DO NOTHING
+                "#
+            )
+            .bind(&paper.id)
+            .bind(&paper.title)
+            .bind(&paper.abstract_text)
+            .bind(&paper.content)
+            .bind(paper.source.to_string())
+            .bind(paper.year.map(|y| y as i32))
+            .bind(&paper.doi)
+            .bind(&paper.url)
+            .bind(&authors_json)
+            .bind(vector)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Store papers from a retrieval run and generate embeddings.
     pub async fn index_papers(&self, papers: &[Paper], embed_fn: impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send>>) -> Result<()> {
         for paper in papers {

@@ -66,7 +66,69 @@ cargo run --features metal -- benchmark
 
 # Test embedding speed
 cargo run --features metal -- test-embedding
+
+# Ingest OpenAlex data (see Bulk Ingestion section)
+cargo run --features cuda -- ingest --source snapshot --snapshot-dir ./openalex-snapshot --batch-size 128
+cargo run --features cuda -- ingest --source api --batch-size 128
 ```
+
+## Bulk Ingestion (OpenAlex)
+
+To build a local index of ~2-3M CS/AI/ML papers for high-quality hybrid search. Two methods available:
+
+### Option A: Snapshot (faster, needs ~250GB disk)
+
+1. **Install AWS CLI** (no account needed):
+   ```bash
+   # Windows
+   winget install Amazon.AWSCLI
+
+   # macOS
+   brew install awscli
+   ```
+
+2. **Download the works snapshot** (~250GB compressed):
+   ```bash
+   aws s3 sync "s3://openalex/data/works" "openalex-snapshot/data/works" --no-sign-request
+   ```
+
+3. **Run ingestion** (filters to CS/AI/ML papers with abstracts, 2015+):
+   ```bash
+   # CUDA (recommended, ~8-10 hours for 2M papers)
+   cargo run --features cuda -- ingest --source snapshot --snapshot-dir ./openalex-snapshot --batch-size 128
+
+   # Metal
+   cargo run --features metal -- ingest --source snapshot --snapshot-dir ./openalex-snapshot --batch-size 128
+   ```
+
+4. **Delete the snapshot** after ingestion to reclaim ~250GB:
+   ```bash
+   rm -rf openalex-snapshot
+   ```
+
+### Option B: API (no download, rate-limited)
+
+No bulk download needed — fetches papers directly from the OpenAlex API:
+
+```bash
+cargo run --features cuda -- ingest --source api --batch-size 128
+```
+
+Rate-limited to ~1M papers/day, so ~2-3 days for the full index. Set `OPENALEX_EMAIL` in `.env` for faster rate limits (polite pool).
+
+### Common options
+
+```bash
+--min-year 2015       # Only include papers from this year onward (default: 2015)
+--batch-size 128      # Papers per GPU batch (reduce to 64 if OOM)
+--max-papers 10000    # Limit total papers (useful for testing)
+```
+
+**Resource requirements:**
+- **Snapshot:** ~250GB temporary disk + ~25-30GB Postgres (permanent)
+- **API:** ~25-30GB Postgres only
+- GPU with 12GB+ VRAM recommended (batch-size 128)
+- If you get OOM errors, reduce `--batch-size` to 64
 
 ## Configuration
 

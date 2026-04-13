@@ -11,3 +11,4 @@ pub mod deep_dive;
 pub mod researcher;
 pub mod collection;
 pub mod trends;
+pub mod ingest;

@@ -23,6 +23,8 @@ pgvector = { version = "0.4.1", features = ["sqlx"] }
 clap = { version = "4.6.0", features = ["derive"] }
 futures = "0.3"
 dirs = "6.0.0"
+flate2 = "1"
+indicatif = "0.17"
 
 # Embedding model (harrier-oss-v1-0.6b via candle)
 candle-core = "0.10.2"

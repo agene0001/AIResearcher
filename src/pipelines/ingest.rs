@@ -1,0 +1,501 @@
+use anyhow::{Context, Result};
+use flate2::read::GzDecoder;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::models::paper::{Paper, PaperSource};
+use crate::processing::embedding::generate_document_embeddings_batch;
+use crate::storage::postgres::DbClient;
+
+/// CS/AI/ML topic IDs and keywords to filter OpenAlex works.
+const CS_TOPIC_KEYWORDS: &[&str] = &[
+    "computer science",
+    "artificial intelligence",
+    "machine learning",
+    "deep learning",
+    "natural language processing",
+    "computer vision",
+    "neural network",
+    "reinforcement learning",
+    "data mining",
+    "information retrieval",
+    "robotics",
+    "computational linguistics",
+    "speech recognition",
+    "knowledge representation",
+    "pattern recognition",
+];
+
+/// Ingest papers from an OpenAlex snapshot directory.
+/// Expects the directory structure: <snapshot_dir>/data/works/updated_date=*/part_*.gz
+pub async fn ingest_snapshot(snapshot_dir: &str, min_year: u32, batch_size: usize, max_papers: Option<usize>) -> Result<()> {
+    let works_dir = Path::new(snapshot_dir).join("data").join("works");
+    if !works_dir.exists() {
+        anyhow::bail!(
+            "Works directory not found at {}. Download with:\n  aws s3 sync \"s3://openalex/data/works\" \"{}/data/works\" --no-sign-request",
+            works_dir.display(),
+            snapshot_dir
+        );
+    }
+
+    let db = DbClient::new().await.context("Database connection required for ingestion")?;
+
+    // Collect all .gz files
+    let mut gz_files: Vec<_> = Vec::new();
+    for entry in fs::read_dir(&works_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            // updated_date=YYYY-MM-DD directories
+            for inner in fs::read_dir(&path)? {
+                let inner = inner?;
+                let inner_path = inner.path();
+                if inner_path.extension().map(|e| e == "gz").unwrap_or(false) {
+                    gz_files.push(inner_path);
+                }
+            }
+        }
+    }
+
+    gz_files.sort();
+    eprintln!("Found {} compressed files to process", gz_files.len());
+
+    let total_ingested = Arc::new(AtomicUsize::new(0));
+    let total_skipped = Arc::new(AtomicUsize::new(0));
+    let total_errors = Arc::new(AtomicUsize::new(0));
+    let start_time = Instant::now();
+
+    let pb = ProgressBar::new(gz_files.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40} {pos}/{len} files | {msg}")
+            .unwrap()
+    );
+
+    for gz_path in &gz_files {
+        let file_start = Instant::now();
+        let mut file_papers: Vec<Paper> = Vec::new();
+
+        // Read and parse the gzipped JSONL file
+        let file = fs::File::open(gz_path)?;
+        let decoder = GzDecoder::new(file);
+        let reader = BufReader::new(decoder);
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+
+            let work: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Filter: must have abstract
+            let abstract_inverted_index = work.get("abstract_inverted_index");
+            if abstract_inverted_index.is_none() || abstract_inverted_index == Some(&serde_json::Value::Null) {
+                total_skipped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            // Filter: publication year
+            let year = work.get("publication_year")
+                .and_then(|y| y.as_u64())
+                .map(|y| y as u32);
+            if year.map(|y| y < min_year).unwrap_or(true) {
+                total_skipped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            // Filter: must be CS/AI/ML related
+            if !is_cs_related(&work) {
+                total_skipped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            // Filter: must have a title
+            let title = match work.get("title").and_then(|t| t.as_str()) {
+                Some(t) if !t.is_empty() => t.to_string(),
+                _ => {
+                    total_skipped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+
+            // Reconstruct abstract
+            let abstract_text = reconstruct_abstract(abstract_inverted_index);
+            if abstract_text.is_empty() {
+                total_skipped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            // Extract metadata
+            let openalex_id = work.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+            let short_id = openalex_id.split('/').last().unwrap_or(&openalex_id).to_string();
+
+            let doi = work.get("doi")
+                .and_then(|d| d.as_str())
+                .map(|s| s.replace("https://doi.org/", ""));
+
+            let authors: Vec<String> = work.get("authorships")
+                .and_then(|a| a.as_array())
+                .map(|arr| arr.iter()
+                    .filter_map(|a| a.get("author")
+                        .and_then(|au| au.get("display_name"))
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string()))
+                    .collect())
+                .unwrap_or_default();
+
+            file_papers.push(Paper {
+                id: format!("openalex:{}", short_id),
+                title,
+                abstract_text,
+                content: None,
+                source: PaperSource::OpenAlex,
+                year,
+                doi,
+                url: Some(openalex_id),
+                authors,
+            });
+        }
+
+        // Embed and insert in batches
+        for batch in file_papers.chunks(batch_size) {
+            // Check if we've hit the max papers limit
+            if let Some(max) = max_papers {
+                if total_ingested.load(Ordering::Relaxed) >= max {
+                    pb.finish_with_message("Reached max papers limit");
+                    break;
+                }
+            }
+            // Prepare texts for batch embedding
+            let texts: Vec<String> = batch.iter()
+                .map(|p| format!("{} {}", p.title, p.abstract_text))
+                .collect();
+
+            // Batch embed
+            match generate_document_embeddings_batch(texts).await {
+                Ok(embeddings) => {
+                    // Batch insert into DB
+                    match db.insert_papers_batch(batch, &embeddings).await {
+                        Ok(_) => {
+                            total_ingested.fetch_add(batch.len(), Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Batch DB insert error: {}", e);
+                            total_errors.fetch_add(batch.len(), Ordering::Relaxed);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Batch embedding error: {}", e);
+                    total_errors.fetch_add(batch.len(), Ordering::Relaxed);
+                }
+            }
+
+            let ingested = total_ingested.load(Ordering::Relaxed);
+            let skipped = total_skipped.load(Ordering::Relaxed);
+            let errors = total_errors.load(Ordering::Relaxed);
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 { ingested as f64 / elapsed } else { 0.0 };
+
+            pb.set_message(format!(
+                "{} ingested, {} skipped, {} errors | {:.1}/s | ETA: {:.1}h for 2M",
+                ingested, skipped, errors, rate,
+                if rate > 0.0 { (2_000_000.0 - ingested as f64) / rate / 3600.0 } else { 0.0 }
+            ));
+        }
+
+        pb.inc(1);
+    }
+
+    pb.finish_with_message("Done!");
+
+    let ingested = total_ingested.load(Ordering::Relaxed);
+    let skipped = total_skipped.load(Ordering::Relaxed);
+    let errors = total_errors.load(Ordering::Relaxed);
+    let elapsed = start_time.elapsed();
+
+    eprintln!("\n{}", "=".repeat(60));
+    eprintln!("  INGESTION COMPLETE");
+    eprintln!("{}", "=".repeat(60));
+    eprintln!("  Papers ingested:  {}", ingested);
+    eprintln!("  Papers skipped:   {}", skipped);
+    eprintln!("  Errors:           {}", errors);
+    eprintln!("  Total time:       {:.1?}", elapsed);
+    eprintln!("  Rate:             {:.1} papers/sec", ingested as f64 / elapsed.as_secs_f64());
+    eprintln!("{}", "=".repeat(60));
+
+    Ok(())
+}
+
+/// Check if a work is CS/AI/ML related by examining topics and concepts.
+fn is_cs_related(work: &serde_json::Value) -> bool {
+    // Check topics (newer OpenAlex field)
+    if let Some(topics) = work.get("topics").and_then(|t| t.as_array()) {
+        for topic in topics {
+            // Check display_name and subfield
+            for field in &["display_name", "subfield"] {
+                if let Some(name) = topic.get(field)
+                    .and_then(|f| {
+                        // Could be a string or an object with display_name
+                        f.as_str().map(|s| s.to_string()).or_else(|| {
+                            f.get("display_name").and_then(|d| d.as_str()).map(|s| s.to_string())
+                        })
+                    })
+                {
+                    let lower = name.to_lowercase();
+                    if CS_TOPIC_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+                        return true;
+                    }
+                }
+            }
+
+            // Check domain
+            if let Some(domain) = topic.get("domain") {
+                let domain_name = domain.get("display_name")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
+                if domain_name.to_lowercase().contains("computer science") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Check concepts (older OpenAlex field, still present in snapshots)
+    if let Some(concepts) = work.get("concepts").and_then(|c| c.as_array()) {
+        for concept in concepts {
+            // Only consider concepts with high relevance score
+            let score = concept.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+            if score < 0.3 {
+                continue;
+            }
+
+            if let Some(name) = concept.get("display_name").and_then(|d| d.as_str()) {
+                let lower = name.to_lowercase();
+                if CS_TOPIC_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Ingest papers via the OpenAlex API with cursor-based pagination.
+/// Slower than snapshot (rate-limited to ~1M papers/day) but requires no bulk download.
+pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usize>) -> Result<()> {
+    let db = DbClient::new().await.context("Database connection required for ingestion")?;
+    let client = reqwest::Client::new();
+
+    let max_total = max_papers.unwrap_or(3_000_000);
+    let per_page = 200; // OpenAlex max per page
+
+    let mut cursor = "*".to_string();
+    let mut total_ingested: usize = 0;
+    let mut total_skipped: usize = 0;
+    let mut total_errors: usize = 0;
+    let start_time = Instant::now();
+
+    let pb = ProgressBar::new(max_total as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40} {pos}/{len} papers | {msg}")
+            .unwrap()
+    );
+
+    let mut base_url = format!(
+        "https://api.openalex.org/works?filter=topics.subfield.id:https://openalex.org/subfields/1702,has_abstract:true,publication_year:>{}&per_page={}&sort=publication_year:desc",
+        min_year - 1,
+        per_page,
+    );
+
+    // Use polite pool if email is set
+    if let Ok(email) = std::env::var("OPENALEX_EMAIL") {
+        base_url.push_str(&format!("&mailto={}", email));
+    }
+
+    loop {
+        if total_ingested >= max_total {
+            break;
+        }
+
+        let url = format!("{}&cursor={}", base_url, cursor);
+
+        let res = match client
+            .get(&url)
+            .header("User-Agent", "autoresearch-lab/0.1 (research tool)")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("API request failed: {}. Retrying in 30s...", e);
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+
+        if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            eprintln!("Rate limited. Waiting 60s...");
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            continue;
+        }
+
+        let body: serde_json::Value = match res.error_for_status() {
+            Ok(r) => r.json().await?,
+            Err(e) => {
+                eprintln!("API error: {}. Retrying in 30s...", e);
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+
+        // Get next cursor
+        let next_cursor = body.get("meta")
+            .and_then(|m| m.get("next_cursor"))
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string());
+
+        let results = match body.get("results").and_then(|r| r.as_array()) {
+            Some(r) => r,
+            None => break,
+        };
+
+        if results.is_empty() {
+            break;
+        }
+
+        // Parse papers from this page
+        let mut page_papers: Vec<Paper> = Vec::new();
+        for item in results {
+            let title = match item.get("title").and_then(|t| t.as_str()) {
+                Some(t) if !t.is_empty() => t.to_string(),
+                _ => { total_skipped += 1; continue; }
+            };
+
+            let abstract_text = reconstruct_abstract(item.get("abstract_inverted_index"));
+            if abstract_text.is_empty() {
+                total_skipped += 1;
+                continue;
+            }
+
+            let openalex_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+            let short_id = openalex_id.split('/').last().unwrap_or(&openalex_id).to_string();
+            let year = item.get("publication_year").and_then(|y| y.as_u64()).map(|y| y as u32);
+            let doi = item.get("doi").and_then(|d| d.as_str())
+                .map(|s| s.replace("https://doi.org/", ""));
+            let authors: Vec<String> = item.get("authorships")
+                .and_then(|a| a.as_array())
+                .map(|arr| arr.iter()
+                    .filter_map(|a| a.get("author")
+                        .and_then(|au| au.get("display_name"))
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string()))
+                    .collect())
+                .unwrap_or_default();
+
+            page_papers.push(Paper {
+                id: format!("openalex:{}", short_id),
+                title,
+                abstract_text,
+                content: None,
+                source: PaperSource::OpenAlex,
+                year,
+                doi,
+                url: Some(openalex_id),
+                authors,
+            });
+        }
+
+        // Embed and insert in batches
+        for batch in page_papers.chunks(batch_size) {
+            if total_ingested >= max_total {
+                break;
+            }
+
+            let texts: Vec<String> = batch.iter()
+                .map(|p| format!("{} {}", p.title, p.abstract_text))
+                .collect();
+
+            match generate_document_embeddings_batch(texts).await {
+                Ok(embeddings) => {
+                    match db.insert_papers_batch(batch, &embeddings).await {
+                        Ok(_) => {
+                            total_ingested += batch.len();
+                        }
+                        Err(e) => {
+                            tracing::warn!("Batch DB insert error: {}", e);
+                            total_errors += batch.len();
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Batch embedding error: {}", e);
+                    total_errors += batch.len();
+                }
+            }
+
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 { total_ingested as f64 / elapsed } else { 0.0 };
+            pb.set_position(total_ingested as u64);
+            pb.set_message(format!(
+                "{} ingested, {} skipped, {} errors | {:.1}/s",
+                total_ingested, total_skipped, total_errors, rate,
+            ));
+        }
+
+        // Advance cursor
+        match next_cursor {
+            Some(c) => cursor = c,
+            None => break,
+        }
+    }
+
+    pb.finish_with_message("Done!");
+
+    let elapsed = start_time.elapsed();
+    eprintln!("\n{}", "=".repeat(60));
+    eprintln!("  API INGESTION COMPLETE");
+    eprintln!("{}", "=".repeat(60));
+    eprintln!("  Papers ingested:  {}", total_ingested);
+    eprintln!("  Papers skipped:   {}", total_skipped);
+    eprintln!("  Errors:           {}", total_errors);
+    eprintln!("  Total time:       {:.1?}", elapsed);
+    eprintln!("  Rate:             {:.1} papers/sec", total_ingested as f64 / elapsed.as_secs_f64());
+    eprintln!("{}", "=".repeat(60));
+
+    Ok(())
+}
+
+/// Reconstruct abstract from OpenAlex's inverted index format.
+fn reconstruct_abstract(inverted_index: Option<&serde_json::Value>) -> String {
+    let index = match inverted_index.and_then(|v| v.as_object()) {
+        Some(obj) => obj,
+        None => return String::new(),
+    };
+
+    let mut positions: Vec<(usize, &str)> = Vec::new();
+
+    for (word, pos_array) in index {
+        if let Some(arr) = pos_array.as_array() {
+            for pos in arr {
+                if let Some(p) = pos.as_u64() {
+                    positions.push((p as usize, word.as_str()));
+                }
+            }
+        }
+    }
+
+    positions.sort_by_key(|(pos, _)| *pos);
+    positions.iter().map(|(_, word)| *word).collect::<Vec<_>>().join(" ")
+}

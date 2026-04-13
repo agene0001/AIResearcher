@@ -8,6 +8,7 @@ use crate::cli::{Cli, Commands};
 use crate::pipelines::retrieve::retrieve_papers;
 use crate::pipelines::collection::generate_collection;
 use crate::pipelines::trends::detect_trends;
+use crate::pipelines::ingest::ingest_snapshot;
 use crate::evaluation::benchmark::{run_benchmark, print_report};
 use crate::mcp_server::run_mcp_server;
 
@@ -82,6 +83,26 @@ async fn main() -> Result<()> {
                     }
                 }
                 Err(e) => eprintln!("Benchmark failed: {}", e),
+            }
+        }
+        Commands::Ingest { source, snapshot_dir, min_year, batch_size, max_papers } => {
+            let max = if max_papers == 0 { None } else { Some(max_papers) };
+            match source.as_str() {
+                "snapshot" => {
+                    let dir = snapshot_dir.unwrap_or_else(|| {
+                        eprintln!("Error: --snapshot-dir is required for snapshot ingestion.");
+                        eprintln!("Download first: aws s3 sync \"s3://openalex/data/works\" \"openalex-snapshot/data/works\" --no-sign-request");
+                        std::process::exit(1);
+                    });
+                    ingest_snapshot(&dir, min_year, batch_size, max).await?;
+                }
+                "api" => {
+                    crate::pipelines::ingest::ingest_api(min_year, batch_size, max).await?;
+                }
+                _ => {
+                    eprintln!("Unknown source '{}'. Use 'snapshot' or 'api'.", source);
+                    std::process::exit(1);
+                }
             }
         }
         Commands::TestEmbedding => {
