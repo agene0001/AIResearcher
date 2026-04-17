@@ -44,8 +44,8 @@ pub enum Commands {
 
     /// Ingest papers from OpenAlex into the database
     Ingest {
-        /// Ingestion source: "snapshot" (bulk download, faster) or "api" (no download, rate-limited)
-        #[arg(long, default_value = "snapshot")]
+        /// Ingestion source: "api" (no download, rate-limited) or "snapshot" (bulk download, faster)
+        #[arg(long, default_value = "api")]
         source: String,
 
         /// Path to the OpenAlex snapshot directory (required for --source snapshot)
