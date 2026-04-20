@@ -314,7 +314,7 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
     );
 
     let mut base_url = format!(
-        "https://api.openalex.org/works?filter=topics.subfield.id:https://openalex.org/subfields/1702,has_abstract:true,publication_year:>{}&per_page={}&sort=publication_year:desc",
+        "https://api.openalex.org/works?filter=topics.subfield.id:1702,has_abstract:true,publication_year:>{}&per_page={}&sort=publication_year:desc",
         min_year - 1,
         per_page,
     );

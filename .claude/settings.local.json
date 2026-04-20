@@ -3,7 +3,11 @@
     "allow": [
       "Bash(git add:*)",
       "Bash(git commit -m ':*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(curl -sS \"https://api.openalex.org/works?filter=topics.subfield.id:https://openalex.org/subfields/1702,has_abstract:true,publication_year:>2014&per_page=2&sort=publication_year:desc&cursor=*\")",
+      "Bash(curl -sS \"https://api.openalex.org/works?filter=topics.subfield.id:1702,has_abstract:true,publication_year:>2014&per_page=2\")",
+      "Bash(curl -sS \"https://api.openalex.org/works?filter=primary_topic.subfield.id:1702,has_abstract:true,publication_year:>2014&per_page=2\")",
+      "Bash(curl -sS \"https://api.openalex.org/subfields/1702\")"
     ]
   }
 }
