@@ -9,7 +9,7 @@ use crate::cli::{Cli, Commands};
 use crate::pipelines::retrieve::retrieve_papers;
 use crate::pipelines::collection::generate_collection;
 use crate::pipelines::trends::detect_trends;
-use crate::pipelines::ingest::ingest_snapshot;
+use crate::pipelines::ingest::{ingest_snapshot, TopicFilter};
 use crate::evaluation::benchmark::{run_benchmark, print_report};
 use crate::mcp_server::run_mcp_server;
 
@@ -116,6 +116,19 @@ async fn main() -> Result<()> {
         }
         Commands::Ingest { source, snapshot_dir, min_year, batch_size, max_papers, field, subfield } => {
             let max = if max_papers == 0 { None } else { Some(max_papers) };
+
+            // Resolve --field/--subfield against OpenAlex's live taxonomy into numeric IDs.
+            // Default when neither is set: the "Computer Science" field.
+            let client = reqwest::Client::new();
+            let taxonomy = crate::pipelines::openalex_taxonomy::Taxonomy::fetch(&client).await?;
+            let topic_filter = if !subfield.is_empty() {
+                TopicFilter::Subfields(taxonomy.resolve_subfields(&subfield)?)
+            } else {
+                let name = field.as_deref().unwrap_or("Computer Science");
+                TopicFilter::Field(taxonomy.resolve_field(name)?)
+            };
+            println!("Ingest filter: {}", topic_filter.to_api_clause());
+
             match source.as_str() {
                 "snapshot" => {
                     let dir = snapshot_dir.unwrap_or_else(|| {
@@ -123,26 +136,10 @@ async fn main() -> Result<()> {
                         eprintln!("Download first: aws s3 sync \"s3://openalex/data/works\" \"openalex-snapshot/data/works\" --no-sign-request");
                         std::process::exit(1);
                     });
-                    ingest_snapshot(&dir, min_year, batch_size, max).await?;
+                    ingest_snapshot(&dir, min_year, batch_size, max, &topic_filter).await?;
                 }
                 "api" => {
-                    // Resolve the human-readable field/subfield names against OpenAlex's taxonomy
-                    // before building the filter clause.
-                    let client = reqwest::Client::new();
-                    let taxonomy = crate::pipelines::openalex_taxonomy::Taxonomy::fetch(&client).await?;
-
-                    let topics_filter = if !subfield.is_empty() {
-                        let ids = taxonomy.resolve_subfields(&subfield)?;
-                        let joined = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("|");
-                        format!("topics.subfield.id:{}", joined)
-                    } else {
-                        // Default to field "Computer Science" if neither flag given.
-                        let name = field.as_deref().unwrap_or("Computer Science");
-                        let id = taxonomy.resolve_field(name)?;
-                        format!("topics.field.id:{}", id)
-                    };
-
-                    println!("Ingest filter: {}", topics_filter);
+                    let topics_filter = topic_filter.to_api_clause();
                     crate::pipelines::ingest::ingest_api(min_year, batch_size, max, &topics_filter).await?;
                 }
                 _ => {

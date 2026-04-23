@@ -92,7 +92,7 @@ To build a local index of ~2-3M CS/AI/ML papers for high-quality hybrid search. 
    aws s3 sync "s3://openalex/data/works" "openalex-snapshot/data/works" --no-sign-request
    ```
 
-3. **Run ingestion** (filters to CS/AI/ML papers with abstracts, 2015+):
+3. **Run ingestion** (filters to papers with abstracts, 2015+, in the selected field/subfield — defaults to the whole Computer Science field; see "Choosing topics" below to narrow):
    ```bash
    # CUDA (recommended, ~8-10 hours for 2M papers)
    cargo run --features cuda -- ingest --source snapshot --snapshot-dir ./openalex-snapshot --batch-size 128
@@ -126,7 +126,7 @@ No API key is required for the free tier — `mailto` is the only authentication
 
 ### Choosing topics: --field and --subfield
 
-OpenAlex organizes works into 26 **fields** and 252 **subfields**. Ingest supports both granularities by **name** (not numeric IDs — names are resolved against OpenAlex's live taxonomy at startup):
+OpenAlex organizes works into 26 **fields** and 252 **subfields**. Ingest supports both granularities by **name** (not numeric IDs — names are resolved against OpenAlex's live taxonomy at startup). The flags apply to **both** `--source api` and `--source snapshot`.
 
 ```bash
 # Coarse: ingest an entire field (mutually exclusive with --subfield)
@@ -146,7 +146,9 @@ Names are matched case-insensitively. On a typo or miss, the resolver prints `Di
 - https://api.openalex.org/fields
 - https://api.openalex.org/subfields
 
-If neither flag is given, the default is `--field "Computer Science"`.
+If neither flag is given, the default is `--field "Computer Science"` (~5M+ works 2015+ with abstracts across AI, ML, CV, NLP, HCI, DB, systems, theory, etc.).
+
+**Seeing the real count.** On `--source api`, the first response from OpenAlex includes a `meta.count` of how many works actually match your filter — this is printed once at startup and used as the progress-bar target. (Previously the bar showed a hardcoded `3M`, which was just an arbitrary ceiling.)
 
 ### Common options
 

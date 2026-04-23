@@ -19,28 +19,75 @@ fn retry_delay(attempt: u32) -> u64 {
     (5u64.saturating_mul(1u64 << shift)).min(300)
 }
 
-/// CS/AI/ML topic IDs and keywords to filter OpenAlex works.
-const CS_TOPIC_KEYWORDS: &[&str] = &[
-    "computer science",
-    "artificial intelligence",
-    "machine learning",
-    "deep learning",
-    "natural language processing",
-    "computer vision",
-    "neural network",
-    "reinforcement learning",
-    "data mining",
-    "information retrieval",
-    "robotics",
-    "computational linguistics",
-    "speech recognition",
-    "knowledge representation",
-    "pattern recognition",
-];
+/// Topic filter for ingest, resolved from CLI `--field`/`--subfield`.
+/// Used by both the snapshot path (local JSONL match) and the API path
+/// (converted to an OpenAlex `filter=` clause).
+#[derive(Debug, Clone)]
+pub enum TopicFilter {
+    Field(u32),
+    Subfields(Vec<u32>),
+}
+
+impl TopicFilter {
+    /// Build the OpenAlex API filter clause, e.g.
+    /// `"topics.field.id:17"` or `"topics.subfield.id:1702|1707"`.
+    pub fn to_api_clause(&self) -> String {
+        match self {
+            TopicFilter::Field(id) => format!("topics.field.id:{}", id),
+            TopicFilter::Subfields(ids) => format!(
+                "topics.subfield.id:{}",
+                ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("|")
+            ),
+        }
+    }
+}
+
+fn extract_openalex_id(obj: &serde_json::Value) -> Option<u32> {
+    obj.get("id")
+        .and_then(|i| i.as_str())
+        .and_then(|s| s.rsplit('/').next())
+        .and_then(|s| s.parse::<u32>().ok())
+}
+
+/// Check if a snapshot work's `topics[]` array contains a topic whose
+/// field/subfield matches the filter.
+fn matches_topic_filter(work: &serde_json::Value, filter: &TopicFilter) -> bool {
+    let topics = match work.get("topics").and_then(|t| t.as_array()) {
+        Some(t) => t,
+        None => return false,
+    };
+    for topic in topics {
+        match filter {
+            TopicFilter::Field(id) => {
+                if let Some(obj) = topic.get("field") {
+                    if extract_openalex_id(obj) == Some(*id) {
+                        return true;
+                    }
+                }
+            }
+            TopicFilter::Subfields(ids) => {
+                if let Some(obj) = topic.get("subfield") {
+                    if let Some(sid) = extract_openalex_id(obj) {
+                        if ids.contains(&sid) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
 
 /// Ingest papers from an OpenAlex snapshot directory.
 /// Expects the directory structure: <snapshot_dir>/data/works/updated_date=*/part_*.gz
-pub async fn ingest_snapshot(snapshot_dir: &str, min_year: u32, batch_size: usize, max_papers: Option<usize>) -> Result<()> {
+pub async fn ingest_snapshot(
+    snapshot_dir: &str,
+    min_year: u32,
+    batch_size: usize,
+    max_papers: Option<usize>,
+    topic_filter: &TopicFilter,
+) -> Result<()> {
     let works_dir = Path::new(snapshot_dir).join("data").join("works");
     if !works_dir.exists() {
         anyhow::bail!(
@@ -120,8 +167,8 @@ pub async fn ingest_snapshot(snapshot_dir: &str, min_year: u32, batch_size: usiz
                 continue;
             }
 
-            // Filter: must be CS/AI/ML related
-            if !is_cs_related(&work) {
+            // Filter: must match the selected field/subfield(s)
+            if !matches_topic_filter(&work, topic_filter) {
                 total_skipped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -243,61 +290,6 @@ pub async fn ingest_snapshot(snapshot_dir: &str, min_year: u32, batch_size: usiz
     Ok(())
 }
 
-/// Check if a work is CS/AI/ML related by examining topics and concepts.
-fn is_cs_related(work: &serde_json::Value) -> bool {
-    // Check topics (newer OpenAlex field)
-    if let Some(topics) = work.get("topics").and_then(|t| t.as_array()) {
-        for topic in topics {
-            // Check display_name and subfield
-            for field in &["display_name", "subfield"] {
-                if let Some(name) = topic.get(field)
-                    .and_then(|f| {
-                        // Could be a string or an object with display_name
-                        f.as_str().map(|s| s.to_string()).or_else(|| {
-                            f.get("display_name").and_then(|d| d.as_str()).map(|s| s.to_string())
-                        })
-                    })
-                {
-                    let lower = name.to_lowercase();
-                    if CS_TOPIC_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
-                        return true;
-                    }
-                }
-            }
-
-            // Check domain
-            if let Some(domain) = topic.get("domain") {
-                let domain_name = domain.get("display_name")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("");
-                if domain_name.to_lowercase().contains("computer science") {
-                    return true;
-                }
-            }
-        }
-    }
-
-    // Check concepts (older OpenAlex field, still present in snapshots)
-    if let Some(concepts) = work.get("concepts").and_then(|c| c.as_array()) {
-        for concept in concepts {
-            // Only consider concepts with high relevance score
-            let score = concept.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
-            if score < 0.3 {
-                continue;
-            }
-
-            if let Some(name) = concept.get("display_name").and_then(|d| d.as_str()) {
-                let lower = name.to_lowercase();
-                if CS_TOPIC_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
 /// Ingest papers via the OpenAlex API with cursor-based pagination.
 /// `topics_filter` is a fully-formed OpenAlex filter clause like
 /// `"topics.field.id:17"` or `"topics.subfield.id:1702|1707"` — built by the caller
@@ -306,14 +298,13 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
     let db = DbClient::new().await.context("Database connection required for ingestion")?;
     let client = reqwest::Client::new();
 
-    let max_total = max_papers.unwrap_or(3_000_000);
     let per_page = 200; // OpenAlex max per page
 
     tracing::info!(
         topics_filter = %topics_filter,
         min_year = min_year,
         batch_size = batch_size,
-        max_total = max_total,
+        max_papers = ?max_papers,
         "Starting OpenAlex API ingest"
     );
 
@@ -323,12 +314,14 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
     let mut total_errors: usize = 0;
     let start_time = Instant::now();
 
-    let pb = ProgressBar::new(max_total as u64);
+    // Progress bar length is set after the first response, once we know OpenAlex's meta.count.
+    let pb = ProgressBar::new(max_papers.map(|m| m as u64).unwrap_or(0));
     pb.set_style(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}] {bar:40} {pos}/{len} papers | {msg}")
             .unwrap()
     );
+    let mut meta_count_logged = false;
 
     let mut base_url = format!(
         "https://api.openalex.org/works?filter={},has_abstract:true,publication_year:>{}&per_page={}&sort=publication_year:desc",
@@ -348,8 +341,10 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
     let mut backoff_attempts: u32 = 0;
 
     loop {
-        if total_ingested >= max_total {
-            break;
+        if let Some(cap) = max_papers {
+            if total_ingested >= cap {
+                break;
+            }
         }
 
         let url = format!("{}&cursor={}", base_url, cursor);
@@ -423,6 +418,28 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
         // Request succeeded — reset backoff.
         backoff_attempts = 0;
 
+        // On the first successful response, report OpenAlex's actual total matching count
+        // and size the progress bar to it (or to the user-imposed max_papers cap, whichever is smaller).
+        if !meta_count_logged {
+            if let Some(count) = body
+                .get("meta")
+                .and_then(|m| m.get("count"))
+                .and_then(|c| c.as_u64())
+            {
+                let target = match max_papers {
+                    Some(cap) => (cap as u64).min(count),
+                    None => count,
+                };
+                pb.set_length(target);
+                pb.println(format!(
+                    "OpenAlex reports {} matching works for filter `{}` (target this run: {})",
+                    count, topics_filter, target
+                ));
+                tracing::info!(openalex_count = count, target = target, "OpenAlex total matching works");
+            }
+            meta_count_logged = true;
+        }
+
         // Get next cursor
         let next_cursor = body.get("meta")
             .and_then(|m| m.get("next_cursor"))
@@ -482,8 +499,10 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
 
         // Embed and insert in batches
         for batch in page_papers.chunks(batch_size) {
-            if total_ingested >= max_total {
-                break;
+            if let Some(cap) = max_papers {
+                if total_ingested >= cap {
+                    break;
+                }
             }
 
             // Skip papers already in DB so reruns don't re-embed ingested rows.
