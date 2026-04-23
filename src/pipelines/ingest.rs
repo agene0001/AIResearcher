@@ -12,6 +12,13 @@ use crate::models::paper::{Paper, PaperSource};
 use crate::processing::embedding::generate_document_embeddings_batch;
 use crate::storage::postgres::DbClient;
 
+/// Exponential backoff for API retries: 5, 10, 20, 40, 80, 160, 300, 300, ...
+/// Unbounded in retry count, capped at 300s per sleep.
+fn retry_delay(attempt: u32) -> u64 {
+    let shift = attempt.min(6);
+    (5u64.saturating_mul(1u64 << shift)).min(300)
+}
+
 /// CS/AI/ML topic IDs and keywords to filter OpenAlex works.
 const CS_TOPIC_KEYWORDS: &[&str] = &[
     "computer science",
@@ -324,6 +331,8 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
         base_url.push_str(&format!("&mailto={}", email));
     }
 
+    let mut backoff_attempts: u32 = 0;
+
     loop {
         if total_ingested >= max_total {
             break;
@@ -339,26 +348,62 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
         {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("API request failed: {}. Retrying in 30s...", e);
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let delay = retry_delay(backoff_attempts);
+                backoff_attempts = backoff_attempts.saturating_add(1);
+                pb.println(format!(
+                    "API request failed (attempt {}): {:#}. Retrying in {}s...",
+                    backoff_attempts, e, delay
+                ));
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 continue;
             }
         };
 
         if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            eprintln!("Rate limited. Waiting 60s...");
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let retry_after = res.headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            let delay = retry_after.unwrap_or_else(|| retry_delay(backoff_attempts));
+            backoff_attempts = backoff_attempts.saturating_add(1);
+            pb.println(format!(
+                "Rate limited (429, attempt {}). Waiting {}s{}...",
+                backoff_attempts,
+                delay,
+                if retry_after.is_some() { " (from Retry-After)" } else { "" }
+            ));
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
             continue;
         }
 
         let body: serde_json::Value = match res.error_for_status() {
-            Ok(r) => r.json().await?,
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    let delay = retry_delay(backoff_attempts);
+                    backoff_attempts = backoff_attempts.saturating_add(1);
+                    pb.println(format!(
+                        "API JSON decode failed (attempt {}): {:#}. Retrying in {}s...",
+                        backoff_attempts, e, delay
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
+            },
             Err(e) => {
-                eprintln!("API error: {}. Retrying in 30s...", e);
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let delay = retry_delay(backoff_attempts);
+                backoff_attempts = backoff_attempts.saturating_add(1);
+                pb.println(format!(
+                    "API HTTP error (attempt {}): {:#}. Retrying in {}s...",
+                    backoff_attempts, e, delay
+                ));
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 continue;
             }
         };
+
+        // Request succeeded — reset backoff.
+        backoff_attempts = 0;
 
         // Get next cursor
         let next_cursor = body.get("meta")
@@ -423,29 +468,57 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
                 break;
             }
 
-            let texts: Vec<String> = batch.iter()
+            // Skip papers already in DB so reruns don't re-embed ingested rows.
+            // Cheap SELECT (one round-trip, indexed lookup) vs. forward pass + GPU work.
+            let batch_ids: Vec<String> = batch.iter().map(|p| p.id.clone()).collect();
+            let existing = match db.existing_paper_ids(&batch_ids).await {
+                Ok(set) => set,
+                Err(e) => {
+                    pb.println(format!(
+                        "existing_paper_ids lookup failed: {:#}. Proceeding without resume-dedup for this batch.", e
+                    ));
+                    std::collections::HashSet::new()
+                }
+            };
+
+            let new_papers: Vec<Paper> = batch.iter()
+                .filter(|p| !existing.contains(&p.id))
+                .cloned()
+                .collect();
+            total_skipped += batch.len() - new_papers.len();
+
+            if new_papers.is_empty() {
+                pb.set_position(total_ingested as u64);
+                pb.set_message(format!(
+                    "{} ingested, {} skipped, {} errors | catching up...",
+                    total_ingested, total_skipped, total_errors,
+                ));
+                continue;
+            }
+
+            let texts: Vec<String> = new_papers.iter()
                 .map(|p| format!("{} {}", p.title, p.abstract_text))
                 .collect();
 
             match generate_document_embeddings_batch(texts).await {
                 Ok(embeddings) => {
-                    match db.insert_papers_batch(batch, &embeddings).await {
+                    match db.insert_papers_batch(&new_papers, &embeddings).await {
                         Ok(_) => {
-                            total_ingested += batch.len();
+                            total_ingested += new_papers.len();
                         }
                         Err(e) => {
-                            if total_errors < 5 * batch.len() {
+                            if total_errors < 5 * new_papers.len() {
                                 pb.println(format!("Batch DB insert error: {:#}", e));
                             }
-                            total_errors += batch.len();
+                            total_errors += new_papers.len();
                         }
                     }
                 }
                 Err(e) => {
-                    if total_errors < 5 * batch.len() {
+                    if total_errors < 5 * new_papers.len() {
                         pb.println(format!("Batch embedding error: {:#}", e));
                     }
-                    total_errors += batch.len();
+                    total_errors += new_papers.len();
                 }
             }
 

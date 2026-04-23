@@ -149,6 +149,19 @@ impl DbClient {
         Ok(papers)
     }
 
+    /// Return the subset of `ids` that are already present in the papers table.
+    /// Used by ingest pipelines to skip re-embedding already-ingested papers on resume.
+    pub async fn existing_paper_ids(&self, ids: &[String]) -> Result<std::collections::HashSet<String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let rows = sqlx::query("SELECT id FROM papers WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get::<String, _>("id")).collect())
+    }
+
     /// Batch insert papers with embeddings. Much faster than individual inserts.
     pub async fn insert_papers_batch(&self, papers: &[Paper], embeddings: &[Vec<f32>]) -> Result<()> {
         if papers.is_empty() {
@@ -166,7 +179,7 @@ impl DbClient {
                 r#"
                 INSERT INTO papers (id, title, abstract_text, content, source, year, doi, url, authors, embedding)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                ON CONFLICT (id) DO NOTHING
+                ON CONFLICT DO NOTHING
                 "#
             )
             .bind(&paper.id)
