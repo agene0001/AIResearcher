@@ -108,21 +108,59 @@ To build a local index of ~2-3M CS/AI/ML papers for high-quality hybrid search. 
 
 ### Option B: API (no download, rate-limited)
 
-No bulk download needed — fetches papers directly from the OpenAlex API:
+No bulk download needed — fetches papers directly from the OpenAlex API. Default filter is the whole **Computer Science** field (AI + ML + CV + NLP + HCI + signal processing + ...):
 
 ```bash
 cargo run --features cuda -- ingest --source api --batch-size 128
 ```
 
-Rate-limited to ~1M papers/day, so ~2-3 days for the full index. Set `OPENALEX_EMAIL` in `.env` for faster rate limits (polite pool).
+OpenAlex caps the free tier at **100,000 requests/day** (≈ 20M papers/day at 200 papers/page), so the daily limit is not a concern at this scale. Set `OPENALEX_EMAIL` in `.env` to enter the polite pool (priority queue, lower latency, same daily cap):
+
+```env
+OPENALEX_EMAIL=you@example.com
+```
+
+No API key is required for the free tier — `mailto` is the only authentication that matters.
+
+**Resumable reruns.** If you Ctrl-C mid-ingest or hit an error, just rerun the same command. The pipeline checks Postgres for already-ingested IDs before embedding, so previously-completed pages fly past in milliseconds; any batches that errored previously (e.g. DOI conflicts) are re-attempted and land cleanly thanks to widened `ON CONFLICT` handling.
+
+### Choosing topics: --field and --subfield
+
+OpenAlex organizes works into 26 **fields** and 252 **subfields**. Ingest supports both granularities by **name** (not numeric IDs — names are resolved against OpenAlex's live taxonomy at startup):
+
+```bash
+# Coarse: ingest an entire field (mutually exclusive with --subfield)
+cargo run --features cuda -- ingest --field "Medicine"
+
+# Fine: one or more subfields (repeat the flag, OR'd together)
+cargo run --features cuda -- ingest \
+    --subfield "Artificial Intelligence" \
+    --subfield "Computer Vision and Pattern Recognition"
+
+# Sports analytics (note the subfield name contains commas — that's fine, each --subfield takes one quoted name):
+cargo run --features cuda -- ingest \
+    --subfield "Physical Therapy, Sports Therapy and Rehabilitation"
+```
+
+Names are matched case-insensitively. On a typo or miss, the resolver prints `Did you mean: ...` suggestions. Browse the full taxonomy at:
+- https://api.openalex.org/fields
+- https://api.openalex.org/subfields
+
+If neither flag is given, the default is `--field "Computer Science"`.
 
 ### Common options
 
 ```bash
---min-year 2015       # Only include papers from this year onward (default: 2015)
---batch-size 128      # Papers per GPU batch (reduce to 64 if OOM)
---max-papers 10000    # Limit total papers (useful for testing)
+--min-year 2015                    # Only include papers from this year onward (default: 2015)
+--batch-size 128                   # Papers per GPU batch (reduce to 64 if OOM)
+--max-papers 10000                 # Limit total papers (useful for testing)
+--field "Computer Science"         # Coarse topic filter (one field, API only)
+--subfield "Artificial Intelligence"  # Fine topic filter (repeatable, API only)
 ```
+
+### Logs
+
+Each run writes structured logs to `logs/autoresearch.log.YYYY-MM-DD` (rotates daily, gitignored). The console shows the progress bar; the log file captures retries, rate-limit waits, batch errors, and a summary on completion. Override the level with `RUST_LOG=debug` for per-batch traces.
 
 **Resource requirements:**
 - **Snapshot:** ~250GB temporary disk + ~25-30GB Postgres (permanent)
