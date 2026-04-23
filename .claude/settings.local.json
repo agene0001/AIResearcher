@@ -7,7 +7,14 @@
       "Bash(curl -sS \"https://api.openalex.org/works?filter=topics.subfield.id:https://openalex.org/subfields/1702,has_abstract:true,publication_year:>2014&per_page=2&sort=publication_year:desc&cursor=*\")",
       "Bash(curl -sS \"https://api.openalex.org/works?filter=topics.subfield.id:1702,has_abstract:true,publication_year:>2014&per_page=2\")",
       "Bash(curl -sS \"https://api.openalex.org/works?filter=primary_topic.subfield.id:1702,has_abstract:true,publication_year:>2014&per_page=2\")",
-      "Bash(curl -sS \"https://api.openalex.org/subfields/1702\")"
+      "Bash(curl -sS \"https://api.openalex.org/subfields/1702\")",
+      "Bash(gh api *)",
+      "Bash(gh auth *)",
+      "Bash(gh repo *)",
+      "Bash(git clone *)",
+      "Bash(git -C /c/Users/Felix/cs_projects_ext/candle log -1 --oneline)",
+      "Bash(git -C /c/Users/Felix/cs_projects_ext/candle checkout -b fix/causal-mask-batch-broadcast)",
+      "Bash(cargo check *)"
     ]
   }
 }

@@ -434,13 +434,17 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
                             total_ingested += batch.len();
                         }
                         Err(e) => {
-                            tracing::warn!("Batch DB insert error: {}", e);
+                            if total_errors < 5 * batch.len() {
+                                pb.println(format!("Batch DB insert error: {:#}", e));
+                            }
                             total_errors += batch.len();
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Batch embedding error: {}", e);
+                    if total_errors < 5 * batch.len() {
+                        pb.println(format!("Batch embedding error: {:#}", e));
+                    }
                     total_errors += batch.len();
                 }
             }

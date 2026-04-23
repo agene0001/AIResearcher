@@ -277,8 +277,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 [[package]]
 name = "candle-core"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bd9895436c1ba5dc1037a19935d084b838db066ff4e15ef7dded020b7c12a4a"
+source = "git+https://github.com/agene0001/candle.git?branch=fix%2Fcausal-mask-batch-broadcast#dc660c03f759ea3070908fdc93d541feec1038de"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -307,8 +306,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "742e2ac226b777134436e9e692f44e77c278b8a7abb1554dc10e44dc911b349f"
+source = "git+https://github.com/agene0001/candle.git?branch=fix%2Fcausal-mask-batch-broadcast#dc660c03f759ea3070908fdc93d541feec1038de"
 dependencies = [
  "cudaforge",
 ]
@@ -316,8 +314,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b6b5a4cae6b4e1ab0efcee4dc05272d11b374a3d1ba121b3a961e36be54ab60"
+source = "git+https://github.com/agene0001/candle.git?branch=fix%2Fcausal-mask-batch-broadcast#dc660c03f759ea3070908fdc93d541feec1038de"
 dependencies = [
  "half",
  "objc2",
@@ -331,8 +328,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9317a09d6530b758990ed7f625ac69ff43653bc9ee28b0464644ad1169ada87"
+source = "git+https://github.com/agene0001/candle.git?branch=fix%2Fcausal-mask-batch-broadcast#dc660c03f759ea3070908fdc93d541feec1038de"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -349,8 +345,7 @@ dependencies = [
 [[package]]
 name = "candle-transformers"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f59d08c89e9f4af9c464e2f3a8e16199e7cc601e6f34538c2cfbb42b623b1783"
+source = "git+https://github.com/agene0001/candle.git?branch=fix%2Fcausal-mask-batch-broadcast#dc660c03f759ea3070908fdc93d541feec1038de"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -368,8 +363,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca0fc3167cbc99c8ec1be618cb620aa21dca95038f118c3579a79370e3dc5f77"
+source = "git+https://github.com/agene0001/candle.git?branch=fix%2Fcausal-mask-batch-broadcast#dc660c03f759ea3070908fdc93d541feec1038de"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -866,7 +860,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -988,7 +982,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3165,7 +3159,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3224,7 +3218,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3821,7 +3815,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4563,7 +4557,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

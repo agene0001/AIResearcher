@@ -37,3 +37,10 @@ tokenizers = "0.22.2"
 default = []
 metal = ["candle-transformers/metal"]   # macOS GPU acceleration (propagates to candle-core + candle-nn)
 cuda = ["candle-transformers/cuda"]     # Windows/Linux Nvidia GPU acceleration
+
+# Temporary fork with causal-mask batch fix (pending upstream PR).
+# Remove once https://github.com/huggingface/candle/pull/3484 is merged.
+[patch.crates-io]
+candle-core         = { git = "https://github.com/agene0001/candle.git", branch = "fix/causal-mask-batch-broadcast" }
+candle-nn           = { git = "https://github.com/agene0001/candle.git", branch = "fix/causal-mask-batch-broadcast" }
+candle-transformers = { git = "https://github.com/agene0001/candle.git", branch = "fix/causal-mask-batch-broadcast" }

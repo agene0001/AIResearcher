@@ -9,6 +9,10 @@ use tokenizers::Tokenizer;
 
 const MODEL_ID: &str = "microsoft/harrier-oss-v1-0.6b";
 const EMBEDDING_DIM: usize = 1024;
+/// Max padded tokens (sub_batch_size × max_seq_len_in_sub_batch) per forward pass.
+/// At fp32 with 28 layers × 1024 hidden, ~700 KB of activation+KV memory per token,
+/// so 12288 tokens ≈ 8.4 GB — fits a 12 GB card with weights (2.4 GB) and headroom.
+const MAX_BATCH_TOKENS: usize = 12288;
 
 const RETRIEVAL_INSTRUCTION: &str =
     "Instruct: Given a research query, retrieve relevant academic papers that address the query\nQuery: ";
@@ -51,91 +55,145 @@ impl HarrierEmbedder {
         let mut model = self.fresh_model()?;
         let hidden_states = model.forward(&input_ids, 0)?; // [1, seq_len, hidden_size]
 
-        // Last-token pooling
+        // Pool then normalize in fp32 — bf16 underflows in the L2 norm sum.
         let last_token = hidden_states
             .narrow(1, seq_len - 1, 1)?
             .squeeze(0)?
-            .squeeze(0)?;
+            .squeeze(0)?
+            .to_dtype(DType::F32)?;
 
-        // L2 normalize
         let norm = last_token.sqr()?.sum_all()?.sqrt()?;
         let normalized = last_token.broadcast_div(&norm)?;
 
-        let embedding: Vec<f32> = normalized.to_dtype(DType::F32)?.to_vec1()?;
+        let embedding: Vec<f32> = normalized.to_vec1()?;
 
         debug_assert_eq!(embedding.len(), EMBEDDING_DIM, "Expected {} dims, got {}", EMBEDDING_DIM, embedding.len());
 
         Ok(embedding)
     }
 
-    /// Embed a batch of texts in a single forward pass.
-    /// Each text is processed independently but shares the same model instance.
-    /// Uses padding to handle variable-length sequences.
+    /// Embed a batch of texts. Tokenizes everything, sorts by length, and packs
+    /// sub-batches up to MAX_BATCH_TOKENS of padded tokens so one long outlier
+    /// can't blow up GPU memory. Returns embeddings in the original input order.
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Single text — use the simpler path
         if texts.len() == 1 {
             return Ok(vec![self.embed_single(&texts[0])?]);
         }
 
-        // Tokenize all texts
-        let encodings: Vec<_> = texts.iter()
-            .map(|text| {
-                self.tokenizer.encode(text.as_str(), true)
-                    .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))
+        // Tokenize once; track original index so we can reorder outputs.
+        let mut items: Vec<(usize, Vec<u32>)> = texts.iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let encoding = self.tokenizer.encode(text.as_str(), true)
+                    .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
+                let ids = encoding.get_ids();
+                let ids = if ids.len() > 32768 { ids[..32768].to_vec() } else { ids.to_vec() };
+                Ok((i, ids))
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Get token IDs and track original lengths (for last-token pooling)
-        let mut all_ids: Vec<Vec<u32>> = Vec::new();
-        let mut seq_lengths: Vec<usize> = Vec::new();
+        // Sort by length descending so each greedy sub-batch is filled by a known max_len.
+        items.sort_by_key(|(_, ids)| std::cmp::Reverse(ids.len()));
 
-        for encoding in &encodings {
-            let ids = encoding.get_ids();
-            let ids = if ids.len() > 32768 { &ids[..32768] } else { ids };
-            seq_lengths.push(ids.len());
-            all_ids.push(ids.to_vec());
+        let mut embeddings: Vec<Option<Vec<f32>>> = (0..texts.len()).map(|_| None).collect();
+
+        let mut cursor = 0;
+        while cursor < items.len() {
+            let max_len = items[cursor].1.len().max(1);
+            // How many items fit at this max_len under the token budget?
+            let mut take = (MAX_BATCH_TOKENS / max_len).max(1);
+            take = take.min(items.len() - cursor);
+
+            let sub_batch = &items[cursor..cursor + take];
+            let sub_embeddings = self.embed_sub_batch(sub_batch, max_len)?;
+
+            // First pass: collect results and find NaN count across the sub-batch.
+            let nan_positions: Vec<usize> = sub_embeddings.iter()
+                .enumerate()
+                .filter(|(_, e)| e.iter().any(|v| !v.is_finite()))
+                .map(|(i, _)| i)
+                .collect();
+
+            if !nan_positions.is_empty() {
+                eprintln!(
+                    "\n=== Sub-batch NaN summary ===\n\
+                     sub_batch_size: {}, max_len: {}, NaN items: {:?} (positions 0-indexed)",
+                    sub_batch.len(), max_len, nan_positions
+                );
+
+                // Retry the first NaN'd item in isolation via embed_single.
+                // If that succeeds, the bug is in the batched forward path.
+                let first_nan = nan_positions[0];
+                let (orig_idx, ids) = &sub_batch[first_nan];
+                let text = &texts[*orig_idx];
+                let preview: String = text.chars().take(150).collect();
+                eprintln!("Re-running item {} (orig_idx {}, seq_len {}) in isolation...",
+                    first_nan, orig_idx, ids.len());
+                match self.embed_single(text) {
+                    Ok(single_emb) => {
+                        let has_nan = single_emb.iter().any(|v| !v.is_finite());
+                        eprintln!("  embed_single result: {} (batched was NaN)",
+                            if has_nan { "ALSO NaN — content issue" } else { "CLEAN — batching bug" });
+                    }
+                    Err(e) => eprintln!("  embed_single errored: {:#}", e),
+                }
+
+                let dump_path = std::env::temp_dir().join(format!("harrier_nan_{}.txt", orig_idx));
+                let _ = std::fs::write(&dump_path, text.as_bytes());
+                eprintln!("text preview: {}\nfirst 10 ids: {:?}\nfull text: {}\n============================\n",
+                    preview,
+                    ids.iter().take(10).copied().collect::<Vec<_>>(),
+                    dump_path.display());
+                anyhow::bail!("NaN in sub-batch — see diagnostic above");
+            }
+
+            for ((orig_idx, _), emb) in sub_batch.iter().zip(sub_embeddings) {
+                embeddings[*orig_idx] = Some(emb);
+            }
+
+            cursor += take;
         }
 
-        let max_len = seq_lengths.iter().copied().max().unwrap_or(0);
+        Ok(embeddings.into_iter().map(|e| e.expect("every index filled")).collect())
+    }
 
-        // Pad all sequences to max_len with pad token (0)
+    /// Run a single forward pass on a uniform sub-batch (already length-sorted, padded to max_len).
+    fn embed_sub_batch(&self, items: &[(usize, Vec<u32>)], max_len: usize) -> Result<Vec<Vec<f32>>> {
+        let batch_size = items.len();
         let pad_token_id: u32 = 0;
-        for ids in &mut all_ids {
-            while ids.len() < max_len {
-                ids.push(pad_token_id);
+
+        let mut batch_data: Vec<u32> = Vec::with_capacity(batch_size * max_len);
+        let mut seq_lengths: Vec<usize> = Vec::with_capacity(batch_size);
+        for (_, ids) in items {
+            seq_lengths.push(ids.len());
+            batch_data.extend_from_slice(ids);
+            for _ in ids.len()..max_len {
+                batch_data.push(pad_token_id);
             }
         }
 
-        // Build batch tensor [batch_size, max_len]
-        let batch_data: Vec<u32> = all_ids.into_iter().flatten().collect();
-        let batch_size = texts.len();
         let input_ids = Tensor::from_vec(batch_data, (batch_size, max_len), &self.device)?;
-
-        // Fresh model with clean KV cache
         let mut model = self.fresh_model()?;
-        let hidden_states = model.forward(&input_ids, 0)?; // [batch_size, max_len, hidden_size]
+        let hidden_states = model.forward(&input_ids, 0)?;
 
-        // Extract last-token embedding for each sequence (at its original length, not padded length)
         let mut embeddings = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
             let last_pos = seq_lengths[i] - 1;
-
-            // Get the hidden state at the last real token position for this batch item
-            let item_hidden = hidden_states.narrow(0, i, 1)?; // [1, max_len, hidden_size]
-            let last_token = item_hidden
+            let last_token = hidden_states
+                .narrow(0, i, 1)?
                 .narrow(1, last_pos, 1)?
                 .squeeze(0)?
-                .squeeze(0)?; // [hidden_size]
+                .squeeze(0)?
+                .to_dtype(DType::F32)?;
 
-            // L2 normalize
             let norm = last_token.sqr()?.sum_all()?.sqrt()?;
             let normalized = last_token.broadcast_div(&norm)?;
+            let embedding: Vec<f32> = normalized.to_vec1()?;
 
-            let embedding: Vec<f32> = normalized.to_dtype(DType::F32)?.to_vec1()?;
             debug_assert_eq!(embedding.len(), EMBEDDING_DIM);
             embeddings.push(embedding);
         }
