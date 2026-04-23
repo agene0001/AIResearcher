@@ -299,13 +299,31 @@ fn is_cs_related(work: &serde_json::Value) -> bool {
 }
 
 /// Ingest papers via the OpenAlex API with cursor-based pagination.
-/// Slower than snapshot (rate-limited to ~1M papers/day) but requires no bulk download.
-pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usize>) -> Result<()> {
+/// `subfields` is a comma-separated list of OpenAlex subfield IDs (e.g. "1702" for AI, "1702,3612" for AI + sports therapy).
+pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usize>, subfields: &str) -> Result<()> {
     let db = DbClient::new().await.context("Database connection required for ingestion")?;
     let client = reqwest::Client::new();
 
     let max_total = max_papers.unwrap_or(3_000_000);
     let per_page = 200; // OpenAlex max per page
+
+    // Translate the comma-separated CLI value into OpenAlex's pipe-OR filter syntax.
+    let subfield_filter = subfields.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("|");
+    if subfield_filter.is_empty() {
+        anyhow::bail!("--subfields must contain at least one OpenAlex subfield ID");
+    }
+
+    tracing::info!(
+        subfields = %subfield_filter,
+        min_year = min_year,
+        batch_size = batch_size,
+        max_total = max_total,
+        "Starting OpenAlex API ingest"
+    );
 
     let mut cursor = "*".to_string();
     let mut total_ingested: usize = 0;
@@ -321,7 +339,8 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
     );
 
     let mut base_url = format!(
-        "https://api.openalex.org/works?filter=topics.subfield.id:1702,has_abstract:true,publication_year:>{}&per_page={}&sort=publication_year:desc",
+        "https://api.openalex.org/works?filter=topics.subfield.id:{},has_abstract:true,publication_year:>{}&per_page={}&sort=publication_year:desc",
+        subfield_filter,
         min_year - 1,
         per_page,
     );
@@ -329,6 +348,9 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
     // Use polite pool if email is set
     if let Ok(email) = std::env::var("OPENALEX_EMAIL") {
         base_url.push_str(&format!("&mailto={}", email));
+        tracing::info!(email = %email, "Using OpenAlex polite pool");
+    } else {
+        tracing::info!("OPENALEX_EMAIL not set — using public pool. Set it for priority queue + higher effective throughput.");
     }
 
     let mut backoff_attempts: u32 = 0;
@@ -350,10 +372,12 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
             Err(e) => {
                 let delay = retry_delay(backoff_attempts);
                 backoff_attempts = backoff_attempts.saturating_add(1);
-                pb.println(format!(
+                let msg = format!(
                     "API request failed (attempt {}): {:#}. Retrying in {}s...",
                     backoff_attempts, e, delay
-                ));
+                );
+                pb.println(&msg);
+                tracing::warn!(attempt = backoff_attempts, delay_s = delay, error = ?e, "API request failed, retrying");
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 continue;
             }
@@ -366,12 +390,12 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
                 .and_then(|s| s.parse::<u64>().ok());
             let delay = retry_after.unwrap_or_else(|| retry_delay(backoff_attempts));
             backoff_attempts = backoff_attempts.saturating_add(1);
+            let suffix = if retry_after.is_some() { " (from Retry-After)" } else { "" };
             pb.println(format!(
                 "Rate limited (429, attempt {}). Waiting {}s{}...",
-                backoff_attempts,
-                delay,
-                if retry_after.is_some() { " (from Retry-After)" } else { "" }
+                backoff_attempts, delay, suffix
             ));
+            tracing::warn!(attempt = backoff_attempts, delay_s = delay, retry_after = ?retry_after, "429 rate-limited");
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
             continue;
         }
@@ -386,6 +410,7 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
                         "API JSON decode failed (attempt {}): {:#}. Retrying in {}s...",
                         backoff_attempts, e, delay
                     ));
+                    tracing::warn!(attempt = backoff_attempts, delay_s = delay, error = ?e, "JSON decode failed");
                     tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                     continue;
                 }
@@ -397,6 +422,7 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
                     "API HTTP error (attempt {}): {:#}. Retrying in {}s...",
                     backoff_attempts, e, delay
                 ));
+                tracing::warn!(attempt = backoff_attempts, delay_s = delay, error = ?e, "HTTP error");
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 continue;
             }
@@ -541,6 +567,7 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
     pb.finish_with_message("Done!");
 
     let elapsed = start_time.elapsed();
+    let rate = total_ingested as f64 / elapsed.as_secs_f64();
     eprintln!("\n{}", "=".repeat(60));
     eprintln!("  API INGESTION COMPLETE");
     eprintln!("{}", "=".repeat(60));
@@ -548,8 +575,17 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
     eprintln!("  Papers skipped:   {}", total_skipped);
     eprintln!("  Errors:           {}", total_errors);
     eprintln!("  Total time:       {:.1?}", elapsed);
-    eprintln!("  Rate:             {:.1} papers/sec", total_ingested as f64 / elapsed.as_secs_f64());
+    eprintln!("  Rate:             {:.1} papers/sec", rate);
     eprintln!("{}", "=".repeat(60));
+
+    tracing::info!(
+        ingested = total_ingested,
+        skipped = total_skipped,
+        errors = total_errors,
+        elapsed_s = elapsed.as_secs_f64(),
+        rate_per_s = rate,
+        "API ingest complete"
+    );
 
     Ok(())
 }

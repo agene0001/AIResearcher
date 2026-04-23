@@ -3,6 +3,7 @@ use clap::Parser;
 use dotenv::dotenv;
 use std::fs;
 use std::path::PathBuf;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::cli::{Cli, Commands};
 use crate::pipelines::retrieve::retrieve_papers;
@@ -24,9 +25,37 @@ mod evaluation;
 mod utils;
 mod mcp_server;
 
+/// Initialize the file-based tracing subscriber.
+/// Writes structured logs to `logs/autoresearch.log.YYYY-MM-DD`, rotating daily.
+/// Never writes to stderr so the progress bar keeps ownership of the terminal.
+/// Log level defaults to INFO and can be overridden via `RUST_LOG` (e.g. `RUST_LOG=debug`).
+fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    fs::create_dir_all("logs")?;
+    let file_appender = tracing_appender::rolling::daily("logs", "autoresearch.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            fmt::layer()
+                .with_writer(non_blocking)
+                .with_ansi(false)
+                .with_target(true)
+                .with_line_number(true),
+        )
+        .init();
+
+    Ok(guard)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
+    let _log_guard = init_logging()?;
+    tracing::info!("autoresearch-lab starting");
 
     let cli = Cli::parse();
 
@@ -85,7 +114,7 @@ async fn main() -> Result<()> {
                 Err(e) => eprintln!("Benchmark failed: {}", e),
             }
         }
-        Commands::Ingest { source, snapshot_dir, min_year, batch_size, max_papers } => {
+        Commands::Ingest { source, snapshot_dir, min_year, batch_size, max_papers, subfields } => {
             let max = if max_papers == 0 { None } else { Some(max_papers) };
             match source.as_str() {
                 "snapshot" => {
@@ -97,7 +126,7 @@ async fn main() -> Result<()> {
                     ingest_snapshot(&dir, min_year, batch_size, max).await?;
                 }
                 "api" => {
-                    crate::pipelines::ingest::ingest_api(min_year, batch_size, max).await?;
+                    crate::pipelines::ingest::ingest_api(min_year, batch_size, max, &subfields).await?;
                 }
                 _ => {
                     eprintln!("Unknown source '{}'. Use 'snapshot' or 'api'.", source);

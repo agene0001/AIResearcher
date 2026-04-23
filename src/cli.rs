@@ -63,6 +63,13 @@ pub enum Commands {
         /// Max papers to ingest, 0 for unlimited (default: 0)
         #[arg(long, default_value = "0")]
         max_papers: usize,
+
+        /// Comma-separated OpenAlex subfield IDs to ingest.
+        /// Default 1702 = Artificial Intelligence. See https://api.openalex.org/subfields for the full list
+        /// (e.g. 3612 for Physical Therapy/Sports Therapy/Rehabilitation). Multiple IDs are OR'd together.
+        /// Only affects `--source api`; snapshot mode uses its own keyword filter.
+        #[arg(long, default_value = "1702")]
+        subfields: String,
     },
 
     /// Test embedding speed with harrier-oss-v1-0.6b
