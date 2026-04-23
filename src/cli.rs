@@ -64,12 +64,17 @@ pub enum Commands {
         #[arg(long, default_value = "0")]
         max_papers: usize,
 
-        /// Comma-separated OpenAlex subfield IDs to ingest.
-        /// Default 1702 = Artificial Intelligence. See https://api.openalex.org/subfields for the full list
-        /// (e.g. 3612 for Physical Therapy/Sports Therapy/Rehabilitation). Multiple IDs are OR'd together.
-        /// Only affects `--source api`; snapshot mode uses its own keyword filter.
-        #[arg(long, default_value = "1702")]
-        subfields: String,
+        /// OpenAlex field name (coarse filter — 26 exist, e.g. "Computer Science", "Medicine").
+        /// Default when neither --field nor --subfield is set: "Computer Science".
+        /// Browse all fields at https://api.openalex.org/fields. Mutually exclusive with --subfield.
+        #[arg(long, conflicts_with = "subfield")]
+        field: Option<String>,
+
+        /// OpenAlex subfield name (fine filter — 252 exist). Pass multiple times for multiple subfields (OR'd).
+        /// Example: --subfield "Artificial Intelligence" --subfield "Computer Vision and Pattern Recognition".
+        /// Browse all subfields at https://api.openalex.org/subfields. Mutually exclusive with --field.
+        #[arg(long, action = clap::ArgAction::Append)]
+        subfield: Vec<String>,
     },
 
     /// Test embedding speed with harrier-oss-v1-0.6b

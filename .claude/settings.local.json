@@ -15,7 +15,10 @@
       "Bash(git -C /c/Users/Felix/cs_projects_ext/candle log -1 --oneline)",
       "Bash(git -C /c/Users/Felix/cs_projects_ext/candle checkout -b fix/causal-mask-batch-broadcast)",
       "Bash(cargo check *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(curl -sS \"https://api.openalex.org/fields?per_page=2\")",
+      "Bash(curl -sS \"https://api.openalex.org/subfields?per_page=2&cursor=*\")",
+      "Bash(curl -sS \"https://api.openalex.org/subfields?search=sports&per_page=5\")"
     ]
   }
 }

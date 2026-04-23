@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
                 Err(e) => eprintln!("Benchmark failed: {}", e),
             }
         }
-        Commands::Ingest { source, snapshot_dir, min_year, batch_size, max_papers, subfields } => {
+        Commands::Ingest { source, snapshot_dir, min_year, batch_size, max_papers, field, subfield } => {
             let max = if max_papers == 0 { None } else { Some(max_papers) };
             match source.as_str() {
                 "snapshot" => {
@@ -126,7 +126,24 @@ async fn main() -> Result<()> {
                     ingest_snapshot(&dir, min_year, batch_size, max).await?;
                 }
                 "api" => {
-                    crate::pipelines::ingest::ingest_api(min_year, batch_size, max, &subfields).await?;
+                    // Resolve the human-readable field/subfield names against OpenAlex's taxonomy
+                    // before building the filter clause.
+                    let client = reqwest::Client::new();
+                    let taxonomy = crate::pipelines::openalex_taxonomy::Taxonomy::fetch(&client).await?;
+
+                    let topics_filter = if !subfield.is_empty() {
+                        let ids = taxonomy.resolve_subfields(&subfield)?;
+                        let joined = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("|");
+                        format!("topics.subfield.id:{}", joined)
+                    } else {
+                        // Default to field "Computer Science" if neither flag given.
+                        let name = field.as_deref().unwrap_or("Computer Science");
+                        let id = taxonomy.resolve_field(name)?;
+                        format!("topics.field.id:{}", id)
+                    };
+
+                    println!("Ingest filter: {}", topics_filter);
+                    crate::pipelines::ingest::ingest_api(min_year, batch_size, max, &topics_filter).await?;
                 }
                 _ => {
                     eprintln!("Unknown source '{}'. Use 'snapshot' or 'api'.", source);

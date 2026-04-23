@@ -12,3 +12,4 @@ pub mod researcher;
 pub mod collection;
 pub mod trends;
 pub mod ingest;
+pub mod openalex_taxonomy;

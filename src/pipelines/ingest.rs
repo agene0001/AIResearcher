@@ -299,26 +299,18 @@ fn is_cs_related(work: &serde_json::Value) -> bool {
 }
 
 /// Ingest papers via the OpenAlex API with cursor-based pagination.
-/// `subfields` is a comma-separated list of OpenAlex subfield IDs (e.g. "1702" for AI, "1702,3612" for AI + sports therapy).
-pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usize>, subfields: &str) -> Result<()> {
+/// `topics_filter` is a fully-formed OpenAlex filter clause like
+/// `"topics.field.id:17"` or `"topics.subfield.id:1702|1707"` — built by the caller
+/// (see `openalex_taxonomy::Taxonomy` for name-to-ID resolution).
+pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usize>, topics_filter: &str) -> Result<()> {
     let db = DbClient::new().await.context("Database connection required for ingestion")?;
     let client = reqwest::Client::new();
 
     let max_total = max_papers.unwrap_or(3_000_000);
     let per_page = 200; // OpenAlex max per page
 
-    // Translate the comma-separated CLI value into OpenAlex's pipe-OR filter syntax.
-    let subfield_filter = subfields.split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("|");
-    if subfield_filter.is_empty() {
-        anyhow::bail!("--subfields must contain at least one OpenAlex subfield ID");
-    }
-
     tracing::info!(
-        subfields = %subfield_filter,
+        topics_filter = %topics_filter,
         min_year = min_year,
         batch_size = batch_size,
         max_total = max_total,
@@ -339,8 +331,8 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
     );
 
     let mut base_url = format!(
-        "https://api.openalex.org/works?filter=topics.subfield.id:{},has_abstract:true,publication_year:>{}&per_page={}&sort=publication_year:desc",
-        subfield_filter,
+        "https://api.openalex.org/works?filter={},has_abstract:true,publication_year:>{}&per_page={}&sort=publication_year:desc",
+        topics_filter,
         min_year - 1,
         per_page,
     );
