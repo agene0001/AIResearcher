@@ -13,6 +13,16 @@ const EMBEDDING_DIM: usize = 1024;
 /// At fp32 with 28 layers × 1024 hidden, ~700 KB of activation+KV memory per token,
 /// so 12288 tokens ≈ 8.4 GB — fits a 12 GB card with weights (2.4 GB) and headroom.
 const MAX_BATCH_TOKENS: usize = 12288;
+/// Last-resort truncation length if a single paper OOMs at its full token count.
+/// 4096 tokens is enough to capture title + most of an abstract.
+const OOM_TRUNCATION_TOKENS: usize = 4096;
+
+/// Detect CUDA out-of-memory errors anywhere in the error chain so we can
+/// halve and retry instead of dropping the batch.
+fn is_oom_error(err: &anyhow::Error) -> bool {
+    let s = format!("{:#}", err);
+    s.contains("out of memory") || s.contains("OUT_OF_MEMORY")
+}
 
 const RETRIEVAL_INSTRUCTION: &str =
     "Instruct: Given a research query, retrieve relevant academic papers that address the query\nQuery: ";
@@ -109,7 +119,7 @@ impl HarrierEmbedder {
             take = take.min(items.len() - cursor);
 
             let sub_batch = &items[cursor..cursor + take];
-            let sub_embeddings = self.embed_sub_batch(sub_batch, max_len)?;
+            let sub_embeddings = self.embed_sub_batch_recoverable(sub_batch)?;
 
             // First pass: collect results and find NaN count across the sub-batch.
             let nan_positions: Vec<usize> = sub_embeddings.iter()
@@ -159,6 +169,49 @@ impl HarrierEmbedder {
         }
 
         Ok(embeddings.into_iter().map(|e| e.expect("every index filled")).collect())
+    }
+
+    /// Wrapper around `embed_sub_batch` that catches CUDA OOM and recursively halves
+    /// the sub-batch until the forward pass fits in VRAM. At single-item granularity,
+    /// falls back to truncating the input to OOM_TRUNCATION_TOKENS.
+    /// Items are assumed to be sorted by length descending (so items[0] dictates max_len).
+    fn embed_sub_batch_recoverable(&self, items: &[(usize, Vec<u32>)]) -> Result<Vec<Vec<f32>>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let max_len = items[0].1.len().max(1);
+
+        match self.embed_sub_batch(items, max_len) {
+            Ok(embs) => Ok(embs),
+            Err(e) if is_oom_error(&e) && items.len() > 1 => {
+                tracing::warn!(
+                    sub_batch_size = items.len(),
+                    max_len = max_len,
+                    "GPU OOM in sub-batch — halving and retrying"
+                );
+                let mid = items.len() / 2;
+                let mut out = self.embed_sub_batch_recoverable(&items[..mid])?;
+                let right = self.embed_sub_batch_recoverable(&items[mid..])?;
+                out.extend(right);
+                Ok(out)
+            }
+            Err(e) if is_oom_error(&e) && items.len() == 1 => {
+                let (orig_idx, ids) = &items[0];
+                if ids.len() > OOM_TRUNCATION_TOKENS {
+                    tracing::warn!(
+                        orig_idx = orig_idx,
+                        original_tokens = ids.len(),
+                        truncated_tokens = OOM_TRUNCATION_TOKENS,
+                        "single-paper OOM — truncating tokens and retrying"
+                    );
+                    let truncated = vec![(*orig_idx, ids[..OOM_TRUNCATION_TOKENS].to_vec())];
+                    self.embed_sub_batch(&truncated, OOM_TRUNCATION_TOKENS)
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Run a single forward pass on a uniform sub-batch (already length-sorted, padded to max_len).
