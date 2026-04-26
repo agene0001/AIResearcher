@@ -560,8 +560,9 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
             }
 
             let elapsed = start_time.elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 { total_ingested as f64 / elapsed } else { 0.0 };
-            pb.set_position((total_ingested + total_skipped) as u64);
+            let walked = total_ingested + total_skipped;
+            let rate = if elapsed > 0.0 { walked as f64 / elapsed } else { 0.0 };
+            pb.set_position(walked as u64);
             pb.set_message(format!(
                 "{} ingested, {} skipped, {} errors | {:.1}/s",
                 total_ingested, total_skipped, total_errors, rate,
