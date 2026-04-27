@@ -49,45 +49,128 @@ fn extract_openalex_id(obj: &serde_json::Value) -> Option<u32> {
         .and_then(|s| s.parse::<u32>().ok())
 }
 
+/// Derive a direct PDF URL from a `landing_page_url` for known OA hosts that
+/// publish at predictable paths but where OpenAlex frequently leaves `pdf_url`
+/// itself null. Big coverage wins for CS specifically:
+///   - arXiv:        /abs/{id}       → /pdf/{id}.pdf
+///   - ACL Anthology: /{id}          → /{id}.pdf
+///   - OpenReview:   /forum?id={id}  → /pdf?id={id}
+///   - bioRxiv/medRxiv: /content/{id} → /content/{id}.full.pdf
+///   - already-pdf landing pages (e.g. ".pdf" suffix): used as-is
+fn derive_pdf_from_landing(landing: &str) -> Option<String> {
+    let l = landing.trim();
+    if l.is_empty() {
+        return None;
+    }
+
+    // arXiv abstract page → derived PDF
+    for prefix in ["https://arxiv.org/abs/", "http://arxiv.org/abs/"] {
+        if let Some(rest) = l.strip_prefix(prefix) {
+            let id = rest.trim_end_matches('/');
+            // Strip a trailing version suffix like /v2 since arxiv.org/pdf accepts both
+            return Some(format!("https://arxiv.org/pdf/{}.pdf", id));
+        }
+    }
+
+    // ACL Anthology
+    for prefix in ["https://aclanthology.org/", "http://aclanthology.org/"] {
+        if let Some(rest) = l.strip_prefix(prefix) {
+            let id = rest.trim_end_matches('/');
+            if !id.is_empty() && !id.ends_with(".pdf") {
+                return Some(format!("https://aclanthology.org/{}.pdf", id));
+            }
+        }
+    }
+
+    // OpenReview forum → PDF
+    if let Some(idx) = l.find("openreview.net/forum?id=") {
+        let id = &l[idx + "openreview.net/forum?id=".len()..];
+        let id = id.split('&').next().unwrap_or(id);
+        if !id.is_empty() {
+            return Some(format!("https://openreview.net/pdf?id={}", id));
+        }
+    }
+
+    // bioRxiv / medRxiv: content/<path> → content/<path>.full.pdf
+    if (l.contains("biorxiv.org/content/") || l.contains("medrxiv.org/content/")) && !l.ends_with(".pdf") {
+        let trimmed = l.trim_end_matches('/');
+        let trimmed = trimmed.trim_end_matches(".full");
+        return Some(format!("{}.full.pdf", trimmed));
+    }
+
+    // Already a direct PDF link
+    if l.to_ascii_lowercase().ends_with(".pdf") {
+        return Some(l.to_string());
+    }
+
+    None
+}
+
 /// Extract a direct PDF URL from an OpenAlex work.
 ///
 /// Resolution order, widest-coverage first:
 ///   1. `best_oa_location.pdf_url` — OpenAlex's curated pick.
-///   2. `primary_location.pdf_url` — the publisher-of-record copy when it's open.
-///   3. Any element of `locations[]` with `is_oa = true` and a non-empty `pdf_url`.
-///   4. Any element of `locations[]` with a non-empty `pdf_url`, OA flag aside.
-///
-/// Steps 3-4 catch arXiv preprints and institutional-repo copies that OpenAlex
-/// indexes but doesn't promote to `best_oa_location`. Returns None only when no
-/// known location publishes a direct PDF link.
+///   2. `primary_location.pdf_url` — publisher-of-record when it's open.
+///   3. `locations[]` entries with `is_oa = true` and a non-empty `pdf_url`.
+///   4. `locations[]` entries with a non-empty `pdf_url`, OA flag aside.
+///   5. Steps 1-4 again, but trying to *derive* the PDF URL from the location's
+///      `landing_page_url` for arXiv / ACL / OpenReview / bioRxiv when OpenAlex
+///      left `pdf_url` itself null — they very often do this for arXiv abstracts
+///      even though the PDF is a one-line URL transform away.
 pub fn extract_pdf_url(work: &serde_json::Value) -> Option<String> {
-    let pick = |loc: &serde_json::Value| -> Option<String> {
+    let pick_direct = |loc: &serde_json::Value| -> Option<String> {
         loc.get("pdf_url")
             .and_then(|u| u.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
     };
+    let pick_derived = |loc: &serde_json::Value| -> Option<String> {
+        loc.get("landing_page_url")
+            .and_then(|u| u.as_str())
+            .and_then(derive_pdf_from_landing)
+    };
 
+    // Pass 1: direct pdf_url across curated picks + locations[]
     for key in ["best_oa_location", "primary_location"] {
         if let Some(loc) = work.get(key).filter(|v| !v.is_null()) {
-            if let Some(url) = pick(loc) {
+            if let Some(url) = pick_direct(loc) {
+                return Some(url);
+            }
+        }
+    }
+    if let Some(locations) = work.get("locations").and_then(|l| l.as_array()) {
+        for loc in locations {
+            if loc.get("is_oa").and_then(|b| b.as_bool()).unwrap_or(false) {
+                if let Some(url) = pick_direct(loc) {
+                    return Some(url);
+                }
+            }
+        }
+        for loc in locations {
+            if let Some(url) = pick_direct(loc) {
                 return Some(url);
             }
         }
     }
 
+    // Pass 2: derive from landing_page_url for known patterns
+    for key in ["best_oa_location", "primary_location"] {
+        if let Some(loc) = work.get(key).filter(|v| !v.is_null()) {
+            if let Some(url) = pick_derived(loc) {
+                return Some(url);
+            }
+        }
+    }
     if let Some(locations) = work.get("locations").and_then(|l| l.as_array()) {
-        // Prefer locations explicitly flagged as open access.
         for loc in locations {
             if loc.get("is_oa").and_then(|b| b.as_bool()).unwrap_or(false) {
-                if let Some(url) = pick(loc) {
+                if let Some(url) = pick_derived(loc) {
                     return Some(url);
                 }
             }
         }
-        // Fallback: any location with a published pdf_url, regardless of is_oa.
         for loc in locations {
-            if let Some(url) = pick(loc) {
+            if let Some(url) = pick_derived(loc) {
                 return Some(url);
             }
         }
