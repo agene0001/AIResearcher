@@ -153,6 +153,31 @@ impl DbClient {
         Ok(papers)
     }
 
+    /// Backfill `pdf_url` on already-ingested rows that currently have it NULL.
+    /// Each tuple is (paper_id, pdf_url). Returns the number of rows actually updated
+    /// (rows whose pdf_url was already non-NULL are left alone).
+    /// Used by the resume-dedup path so a rerun opportunistically populates pdf_url
+    /// for papers ingested before the column existed — no re-embedding needed.
+    pub async fn backfill_pdf_urls(&self, updates: &[(String, String)]) -> Result<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut updated: usize = 0;
+        for (id, pdf_url) in updates {
+            let result = sqlx::query(
+                "UPDATE papers SET pdf_url = $1 WHERE id = $2 AND pdf_url IS NULL",
+            )
+            .bind(pdf_url)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            updated += result.rows_affected() as usize;
+        }
+        tx.commit().await?;
+        Ok(updated)
+    }
+
     /// Look up the stored PDF URL for a paper, if any.
     /// Used by tier-2 deep_read to fetch the source document.
     pub async fn get_pdf_url(&self, paper_id: &str) -> Result<Option<String>> {

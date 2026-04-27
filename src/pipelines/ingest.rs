@@ -334,6 +334,7 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
     let mut total_ingested: usize = 0;
     let mut total_skipped: usize = 0;
     let mut total_errors: usize = 0;
+    let mut total_backfilled: usize = 0;
     let start_time = Instant::now();
 
     // Progress bar length is set after the first response, once we know OpenAlex's meta.count.
@@ -543,6 +544,20 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
                 }
             };
 
+            // Opportunistic backfill: for papers already in the DB, fill in pdf_url
+            // (and other newly-tracked fields in the future) when the existing row
+            // has them NULL but our new fetch has them populated. No re-embedding.
+            let backfill_data: Vec<(String, String)> = batch.iter()
+                .filter(|p| existing.contains(&p.id))
+                .filter_map(|p| p.pdf_url.as_ref().map(|u| (p.id.clone(), u.clone())))
+                .collect();
+            if !backfill_data.is_empty() {
+                match db.backfill_pdf_urls(&backfill_data).await {
+                    Ok(n) => total_backfilled += n,
+                    Err(e) => pb.println(format!("backfill_pdf_urls error: {:#}", e)),
+                }
+            }
+
             let new_papers: Vec<Paper> = batch.iter()
                 .filter(|p| !existing.contains(&p.id))
                 .cloned()
@@ -552,8 +567,8 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
             if new_papers.is_empty() {
                 pb.set_position((total_ingested + total_skipped) as u64);
                 pb.set_message(format!(
-                    "{} ingested, {} skipped, {} errors | catching up...",
-                    total_ingested, total_skipped, total_errors,
+                    "{} ingested, {} skipped (+{} pdf_url backfilled), {} errors | catching up...",
+                    total_ingested, total_skipped, total_backfilled, total_errors,
                 ));
                 continue;
             }
@@ -589,8 +604,8 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
             let rate = if elapsed > 0.0 { walked as f64 / elapsed } else { 0.0 };
             pb.set_position(walked as u64);
             pb.set_message(format!(
-                "{} ingested, {} skipped, {} errors | {:.1}/s",
-                total_ingested, total_skipped, total_errors, rate,
+                "{} ingested, {} skipped (+{} pdf_url backfilled), {} errors | {:.1}/s",
+                total_ingested, total_skipped, total_backfilled, total_errors, rate,
             ));
         }
 
@@ -610,6 +625,7 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
     eprintln!("{}", "=".repeat(60));
     eprintln!("  Papers ingested:  {}", total_ingested);
     eprintln!("  Papers skipped:   {}", total_skipped);
+    eprintln!("  pdf_url backfilled: {}", total_backfilled);
     eprintln!("  Errors:           {}", total_errors);
     eprintln!("  Total time:       {:.1?}", elapsed);
     eprintln!("  Rate:             {:.1} papers/sec", rate);
@@ -618,6 +634,7 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
     tracing::info!(
         ingested = total_ingested,
         skipped = total_skipped,
+        backfilled = total_backfilled,
         errors = total_errors,
         elapsed_s = elapsed.as_secs_f64(),
         rate_per_s = rate,
