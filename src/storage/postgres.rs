@@ -153,6 +153,68 @@ impl DbClient {
         Ok(papers)
     }
 
+    /// Look up the stored PDF URL for a paper, if any.
+    /// Used by tier-2 deep_read to fetch the source document.
+    pub async fn get_pdf_url(&self, paper_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT pdf_url FROM papers WHERE id = $1")
+            .bind(paper_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.try_get::<Option<String>, _>("pdf_url").ok().flatten()))
+    }
+
+    /// Look up a cached full-text extraction. Returns (markdown, error) — either may be Some,
+    /// neither is Some only if the row was never written. Returns None if no row exists at all.
+    pub async fn get_full_text(&self, paper_id: &str) -> Result<Option<(Option<String>, Option<String>)>> {
+        let row = sqlx::query("SELECT markdown, error FROM paper_full_text WHERE paper_id = $1")
+            .bind(paper_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| (
+            r.try_get::<Option<String>, _>("markdown").ok().flatten(),
+            r.try_get::<Option<String>, _>("error").ok().flatten(),
+        )))
+    }
+
+    /// Cache a successful full-text extraction. Overwrites any prior error/result.
+    pub async fn cache_full_text(&self, paper_id: &str, markdown: &str, parser: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO paper_full_text (paper_id, markdown, parser, error)
+            VALUES ($1, $2, $3, NULL)
+            ON CONFLICT (paper_id) DO UPDATE
+            SET markdown = EXCLUDED.markdown,
+                parser = EXCLUDED.parser,
+                error = NULL,
+                fetched_at = NOW()
+            "#,
+        )
+        .bind(paper_id)
+        .bind(markdown)
+        .bind(parser)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Cache a failed extraction so we don't retry on every read. Delete the row to retry.
+    pub async fn cache_full_text_error(&self, paper_id: &str, error: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO paper_full_text (paper_id, markdown, parser, error)
+            VALUES ($1, NULL, NULL, $2)
+            ON CONFLICT (paper_id) DO UPDATE
+            SET error = EXCLUDED.error,
+                fetched_at = NOW()
+            "#,
+        )
+        .bind(paper_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Return the subset of `ids` that are already present in the papers table.
     /// Used by ingest pipelines to skip re-embedding already-ingested papers on resume.
     pub async fn existing_paper_ids(&self, ids: &[String]) -> Result<std::collections::HashSet<String>> {

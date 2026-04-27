@@ -80,6 +80,14 @@ pub enum Commands {
     /// Test embedding speed with harrier-oss-v1-0.6b
     TestEmbedding,
 
+    /// Tier-2 deep read: download a paper's PDF, parse it (marker/pdftotext),
+    /// cache the result in `paper_full_text`, and print the extracted text.
+    /// The paper must already exist in the DB and have a pdf_url.
+    ReadPaper {
+        /// Paper id, e.g. "openalex:W12345" or "arxiv:2401.12345".
+        id: String,
+    },
+
     /// Install the MCP server to an editor (cursor, claude)
     InstallMcp {
         /// The editor to install to (e.g., 'cursor' or 'claude')

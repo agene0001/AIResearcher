@@ -180,6 +180,10 @@ async fn main() -> Result<()> {
             println!("Estimated 10K papers: {:.1}m", avg as f64 * 10000.0 / 1000.0 / 60.0);
             println!("Estimated 2M papers: {:.1}h", avg as f64 * 2_000_000.0 / 1000.0 / 3600.0);
         }
+        Commands::ReadPaper { id } => {
+            let markdown = crate::pipelines::deep_read::read_paper(&id).await?;
+            println!("{}", markdown);
+        }
         Commands::InstallMcp { editor } => {
             install_mcp(&editor)?;
         }

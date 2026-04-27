@@ -9,6 +9,7 @@ use crate::pipelines::{
     deep_dive::deep_dive,
     researcher::research_and_propose,
     trends::detect_trends,
+    deep_read::read_paper,
 };
 
 #[derive(Deserialize)]
@@ -160,6 +161,20 @@ pub async fn run_mcp_server() -> Result<()> {
                                 },
                                 "required": ["field"]
                             }
+                        },
+                        {
+                            "name": "read_paper",
+                            "description": "Tier-2 deep read of a single paper. Downloads the PDF (using the OpenAlex/arxiv pdf_url stored at ingest time), runs marker_single (preferred) or pdftotext, caches the extracted markdown/text in paper_full_text, and returns it. Use this AFTER you've narrowed down to a specific paper via search/explore — it gives the full methods, tables, equations, and (with marker) figures, which an abstract doesn't.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {
+                                        "type": "string",
+                                        "description": "The paper id as stored in the DB, e.g. 'openalex:W12345' or 'arxiv:2401.12345'."
+                                    }
+                                },
+                                "required": ["id"]
+                            }
                         }
                     ]
                 }));
@@ -262,6 +277,20 @@ pub async fn run_mcp_server() -> Result<()> {
                             }
                         } else {
                             response.error = Some(json!({ "code": -32602, "message": "Missing 'field' argument" }));
+                        }
+                    }
+                    "read_paper" => {
+                        if let Some(id_str) = args.get("id").and_then(|v| v.as_str()) {
+                            match read_paper(id_str).await {
+                                Ok(markdown) => {
+                                    response.result = Some(json!({
+                                        "content": [{ "type": "text", "text": markdown }]
+                                    }));
+                                }
+                                Err(e) => response.error = Some(json!({ "code": -32000, "message": format!("{:#}", e) })),
+                            }
+                        } else {
+                            response.error = Some(json!({ "code": -32602, "message": "Missing 'id' argument" }));
                         }
                     }
                     _ => {

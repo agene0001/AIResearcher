@@ -13,3 +13,4 @@ pub mod collection;
 pub mod trends;
 pub mod ingest;
 pub mod openalex_taxonomy;
+pub mod deep_read;

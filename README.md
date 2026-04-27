@@ -191,6 +191,31 @@ OLLAMA_HOST=http://localhost:11434
 # SEMANTIC_SCHOLAR_API_KEY=your_key_here
 ```
 
+## Tier 2: deep read of a paper
+
+Search/embedding (tier 1) is title + abstract — great for finding candidate papers, but useless for "what hyperparameters did this paper use" or "what's in Table 3?". Tier 2 fixes that: given a paper id, download its PDF and extract the full content (methods, tables, equations, with marker also figures), cache in `paper_full_text`, and return the markdown.
+
+```bash
+# CLI: print the full text of a paper
+cargo run --features cuda -- read-paper "openalex:W4385245678"
+
+# Or via MCP, the LLM calls the `read_paper` tool with {"id": "..."}
+```
+
+The pipeline auto-detects which parser is on `PATH`, preferring `marker_single` (Markdown with tables/equations/figures) and falling back to `pdftotext` (plain text). Override with `PDF_PARSER=marker|pdftotext`.
+
+**Install one of these:**
+
+| Parser | Quality | Install |
+|---|---|---|
+| `pdftotext` (default fallback) | Plain text. Tables/math get scrambled. Fast (~0.5s/paper). | `brew install poppler` / `apt install poppler-utils` / `winget install poppler` |
+| `marker_single` (preferred) | Markdown with tables/equations preserved, figures saved alongside. ML-based, GPU-accelerated. ~5-15s/paper on CUDA. | `pip install marker-pdf` (first run downloads ~1.5GB of models) |
+
+**Caveats:**
+- Only works for papers with a `pdf_url` populated at ingest time. Older rows ingested before the column was added (commit `c3e5e7f`) will return an error until backfilled.
+- Failed extractions (404'd PDFs, paywalled, parser crashes) are cached as errors in `paper_full_text`. Delete the row to retry: `DELETE FROM paper_full_text WHERE paper_id = 'openalex:...'`.
+- Marker uses CUDA, so heavy tier-2 reads will contend with the harrier embedding model. Don't run bulk ingest and bulk reads in parallel.
+
 ## MCP Server
 
 Run as an MCP server for Claude Desktop or Cursor:
