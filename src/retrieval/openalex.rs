@@ -56,14 +56,7 @@ pub async fn search_openalex(query: &str, max_results: usize) -> Result<Vec<Pape
             let short_id = openalex_id.split('/').last().unwrap_or(&openalex_id).to_string();
 
             if !title.is_empty() {
-                let pdf_url = ["best_oa_location", "primary_location"].iter().find_map(|key| {
-                    item.get(*key)
-                        .filter(|v| !v.is_null())
-                        .and_then(|loc| loc.get("pdf_url"))
-                        .and_then(|u| u.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                });
+                let pdf_url = crate::pipelines::ingest::extract_pdf_url(item);
                 papers.push(Paper {
                     id: format!("openalex:{}", short_id),
                     title,

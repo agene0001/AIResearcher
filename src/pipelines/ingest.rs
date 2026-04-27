@@ -49,22 +49,50 @@ fn extract_openalex_id(obj: &serde_json::Value) -> Option<u32> {
         .and_then(|s| s.parse::<u32>().ok())
 }
 
-/// Extract a direct PDF URL from an OpenAlex work, preferring `best_oa_location`
-/// (OpenAlex's curated best open-access copy) and falling back to `primary_location`.
-/// Returns None if no PDF link is published — a tier-2 reader can fall back to
-/// `url`/DOI in that case.
-fn extract_pdf_url(work: &serde_json::Value) -> Option<String> {
-    for key in ["best_oa_location", "primary_location"] {
-        let url = work
-            .get(key)
-            .filter(|v| !v.is_null())
-            .and_then(|loc| loc.get("pdf_url"))
+/// Extract a direct PDF URL from an OpenAlex work.
+///
+/// Resolution order, widest-coverage first:
+///   1. `best_oa_location.pdf_url` — OpenAlex's curated pick.
+///   2. `primary_location.pdf_url` — the publisher-of-record copy when it's open.
+///   3. Any element of `locations[]` with `is_oa = true` and a non-empty `pdf_url`.
+///   4. Any element of `locations[]` with a non-empty `pdf_url`, OA flag aside.
+///
+/// Steps 3-4 catch arXiv preprints and institutional-repo copies that OpenAlex
+/// indexes but doesn't promote to `best_oa_location`. Returns None only when no
+/// known location publishes a direct PDF link.
+pub fn extract_pdf_url(work: &serde_json::Value) -> Option<String> {
+    let pick = |loc: &serde_json::Value| -> Option<String> {
+        loc.get("pdf_url")
             .and_then(|u| u.as_str())
-            .filter(|s| !s.is_empty());
-        if let Some(s) = url {
-            return Some(s.to_string());
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+
+    for key in ["best_oa_location", "primary_location"] {
+        if let Some(loc) = work.get(key).filter(|v| !v.is_null()) {
+            if let Some(url) = pick(loc) {
+                return Some(url);
+            }
         }
     }
+
+    if let Some(locations) = work.get("locations").and_then(|l| l.as_array()) {
+        // Prefer locations explicitly flagged as open access.
+        for loc in locations {
+            if loc.get("is_oa").and_then(|b| b.as_bool()).unwrap_or(false) {
+                if let Some(url) = pick(loc) {
+                    return Some(url);
+                }
+            }
+        }
+        // Fallback: any location with a published pdf_url, regardless of is_oa.
+        for loc in locations {
+            if let Some(url) = pick(loc) {
+                return Some(url);
+            }
+        }
+    }
+
     None
 }
 
