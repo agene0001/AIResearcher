@@ -70,6 +70,7 @@ pub async fn search_dblp(query: &str, max_results: usize) -> Result<Vec<Paper>> 
                     year,
                     doi,
                     url: if dblp_url.is_empty() { None } else { Some(dblp_url) },
+                    pdf_url: None,
                     authors,
                 });
             }

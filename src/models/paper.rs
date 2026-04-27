@@ -38,8 +38,13 @@ pub struct Paper {
     pub year: Option<u32>,
     /// DOI, if available
     pub doi: Option<String>,
-    /// URL to the paper
+    /// URL to the paper (landing page)
     pub url: Option<String>,
+    /// Direct PDF URL when an open-access copy is known. Populated from OpenAlex's
+    /// `best_oa_location.pdf_url` during ingest; used by tier-2 deep-read pipelines
+    /// to fetch the full paper for figure/table/methods extraction.
+    #[serde(default)]
+    pub pdf_url: Option<String>,
     /// Authors list
     #[serde(default)]
     pub authors: Vec<String>,

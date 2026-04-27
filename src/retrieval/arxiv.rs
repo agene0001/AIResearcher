@@ -44,6 +44,8 @@ pub async fn search_arxiv(query: &str, max_results: usize) -> Result<Vec<Paper>>
         };
 
         if !id.is_empty() && !title.is_empty() {
+            let bare_id = clean_id.strip_prefix("arxiv:").unwrap_or(&clean_id);
+            let pdf_url = Some(format!("https://arxiv.org/pdf/{}.pdf", bare_id));
             papers.push(Paper {
                 id: clean_id,
                 title,
@@ -53,6 +55,7 @@ pub async fn search_arxiv(query: &str, max_results: usize) -> Result<Vec<Paper>>
                 year,
                 doi: None,
                 url: Some(id),
+                pdf_url,
                 authors,
             });
         }

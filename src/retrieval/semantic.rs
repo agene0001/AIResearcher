@@ -56,6 +56,7 @@ pub async fn search_semantic_scholar(query: &str, max_results: usize) -> Result<
                     year,
                     doi,
                     url,
+                    pdf_url: None,
                     authors,
                 });
             }

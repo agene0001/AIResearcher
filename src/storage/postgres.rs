@@ -42,8 +42,8 @@ impl DbClient {
 
         sqlx::query(
             r#"
-            INSERT INTO papers (id, title, abstract_text, content, source, year, doi, url, authors, embedding)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            INSERT INTO papers (id, title, abstract_text, content, source, year, doi, url, pdf_url, authors, embedding)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT (id) DO UPDATE
             SET title = EXCLUDED.title,
                 abstract_text = EXCLUDED.abstract_text,
@@ -52,6 +52,7 @@ impl DbClient {
                 year = EXCLUDED.year,
                 doi = EXCLUDED.doi,
                 url = EXCLUDED.url,
+                pdf_url = COALESCE(EXCLUDED.pdf_url, papers.pdf_url),
                 authors = EXCLUDED.authors,
                 embedding = EXCLUDED.embedding
             "#
@@ -64,6 +65,7 @@ impl DbClient {
         .bind(paper.year.map(|y| y as i32))
         .bind(&paper.doi)
         .bind(&paper.url)
+        .bind(&paper.pdf_url)
         .bind(&authors_json)
         .bind(vector)
         .execute(&self.pool)
@@ -80,14 +82,14 @@ impl DbClient {
         let records = sqlx::query(
             r#"
             WITH semantic_search AS (
-                SELECT id, title, abstract_text, content, source, year, doi, url, authors,
+                SELECT id, title, abstract_text, content, source, year, doi, url, pdf_url, authors,
                        1 - (embedding <=> $1) AS semantic_score
                 FROM papers
                 ORDER BY embedding <=> $1
                 LIMIT 50
             ),
             keyword_search AS (
-                SELECT id, title, abstract_text, content, source, year, doi, url, authors,
+                SELECT id, title, abstract_text, content, source, year, doi, url, pdf_url, authors,
                        ts_rank_cd(search_vector, plainto_tsquery('english', $2)) AS keyword_score
                 FROM papers
                 WHERE search_vector @@ plainto_tsquery('english', $2)
@@ -103,6 +105,7 @@ impl DbClient {
                 COALESCE(s.year, k.year) as year,
                 COALESCE(s.doi, k.doi) as doi,
                 COALESCE(s.url, k.url) as url,
+                COALESCE(s.pdf_url, k.pdf_url) as pdf_url,
                 COALESCE(s.authors, k.authors) as authors,
                 COALESCE(s.semantic_score, 0.0) as semantic_score,
                 COALESCE(k.keyword_score, 0.0) as keyword_score,
@@ -142,6 +145,7 @@ impl DbClient {
                 year: r.try_get::<Option<i32>, _>("year").ok().flatten().map(|y| y as u32),
                 doi: r.try_get("doi").ok().flatten(),
                 url: r.try_get("url").ok().flatten(),
+                pdf_url: r.try_get("pdf_url").ok().flatten(),
                 authors,
             });
         }
@@ -177,8 +181,8 @@ impl DbClient {
 
             sqlx::query(
                 r#"
-                INSERT INTO papers (id, title, abstract_text, content, source, year, doi, url, authors, embedding)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                INSERT INTO papers (id, title, abstract_text, content, source, year, doi, url, pdf_url, authors, embedding)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 ON CONFLICT DO NOTHING
                 "#
             )
@@ -190,6 +194,7 @@ impl DbClient {
             .bind(paper.year.map(|y| y as i32))
             .bind(&paper.doi)
             .bind(&paper.url)
+            .bind(&paper.pdf_url)
             .bind(&authors_json)
             .bind(vector)
             .execute(&mut *tx)

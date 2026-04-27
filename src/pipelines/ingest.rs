@@ -49,6 +49,25 @@ fn extract_openalex_id(obj: &serde_json::Value) -> Option<u32> {
         .and_then(|s| s.parse::<u32>().ok())
 }
 
+/// Extract a direct PDF URL from an OpenAlex work, preferring `best_oa_location`
+/// (OpenAlex's curated best open-access copy) and falling back to `primary_location`.
+/// Returns None if no PDF link is published — a tier-2 reader can fall back to
+/// `url`/DOI in that case.
+fn extract_pdf_url(work: &serde_json::Value) -> Option<String> {
+    for key in ["best_oa_location", "primary_location"] {
+        let url = work
+            .get(key)
+            .filter(|v| !v.is_null())
+            .and_then(|loc| loc.get("pdf_url"))
+            .and_then(|u| u.as_str())
+            .filter(|s| !s.is_empty());
+        if let Some(s) = url {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
 /// Check if a snapshot work's `topics[]` array contains a topic whose
 /// field/subfield matches the filter.
 fn matches_topic_filter(work: &serde_json::Value, filter: &TopicFilter) -> bool {
@@ -207,6 +226,8 @@ pub async fn ingest_snapshot(
                     .collect())
                 .unwrap_or_default();
 
+            let pdf_url = extract_pdf_url(&work);
+
             file_papers.push(Paper {
                 id: format!("openalex:{}", short_id),
                 title,
@@ -216,6 +237,7 @@ pub async fn ingest_snapshot(
                 year,
                 doi,
                 url: Some(openalex_id),
+                pdf_url,
                 authors,
             });
         }
@@ -484,6 +506,8 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
                     .collect())
                 .unwrap_or_default();
 
+            let pdf_url = extract_pdf_url(item);
+
             page_papers.push(Paper {
                 id: format!("openalex:{}", short_id),
                 title,
@@ -493,6 +517,7 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
                 year,
                 doi,
                 url: Some(openalex_id),
+                pdf_url,
                 authors,
             });
         }

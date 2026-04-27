@@ -71,6 +71,7 @@ pub async fn search_pubmed(query: &str, max_results: usize) -> Result<Vec<Paper>
                         year,
                         doi,
                         url: Some(format!("https://pubmed.ncbi.nlm.nih.gov/{}/", pmid)),
+                        pdf_url: None,
                         authors,
                     });
                 }

@@ -92,6 +92,7 @@ pub async fn search_crossref(query: &str, max_results: usize) -> Result<Vec<Pape
                     year,
                     doi: Some(doi),
                     url,
+                    pdf_url: None,
                     authors,
                 });
             }
