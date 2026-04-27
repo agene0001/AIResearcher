@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use std::fs;
 use std::path::PathBuf;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
