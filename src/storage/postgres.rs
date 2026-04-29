@@ -9,6 +9,16 @@ pub struct DbClient {
     pub pool: Pool<Postgres>,
 }
 
+/// Subset of paper fields needed by the tier-2 PDF resolver chain.
+/// Returned by `get_paper_resolver_meta`.
+#[derive(Debug, Clone)]
+pub struct ResolverMeta {
+    pub pdf_url: Option<String>,
+    pub doi: Option<String>,
+    pub title: String,
+    pub first_author: Option<String>,
+}
+
 impl DbClient {
     pub async fn new() -> Result<Self> {
         let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/autoresearch".to_string());
@@ -178,14 +188,41 @@ impl DbClient {
         Ok(updated)
     }
 
-    /// Look up the stored PDF URL for a paper, if any.
-    /// Used by tier-2 deep_read to fetch the source document.
-    pub async fn get_pdf_url(&self, paper_id: &str) -> Result<Option<String>> {
-        let row = sqlx::query("SELECT pdf_url FROM papers WHERE id = $1")
+    /// Fetch the metadata fields the tier-2 PDF resolver needs to fall back to
+    /// external services (Unpaywall, arXiv title search, Semantic Scholar) when
+    /// `pdf_url` is NULL. Returns (pdf_url, doi, title, first_author, year).
+    pub async fn get_paper_resolver_meta(
+        &self,
+        paper_id: &str,
+    ) -> Result<Option<ResolverMeta>> {
+        let row = sqlx::query(
+            "SELECT pdf_url, doi, title, authors FROM papers WHERE id = $1",
+        )
+        .bind(paper_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(r) = row else { return Ok(None) };
+        let authors_json: serde_json::Value =
+            r.try_get("authors").unwrap_or(serde_json::json!([]));
+        let authors: Vec<String> = serde_json::from_value(authors_json).unwrap_or_default();
+        Ok(Some(ResolverMeta {
+            pdf_url: r.try_get::<Option<String>, _>("pdf_url").ok().flatten(),
+            doi: r.try_get::<Option<String>, _>("doi").ok().flatten(),
+            title: r.try_get("title").unwrap_or_default(),
+            first_author: authors.into_iter().next(),
+        }))
+    }
+
+    /// Update a paper's pdf_url. Used by the tier-2 resolver when an external
+    /// service (Unpaywall, arXiv search, etc.) discovers a URL the original
+    /// ingest didn't have, so future reads skip the resolver entirely.
+    pub async fn update_pdf_url(&self, paper_id: &str, pdf_url: &str) -> Result<()> {
+        sqlx::query("UPDATE papers SET pdf_url = $1 WHERE id = $2")
+            .bind(pdf_url)
             .bind(paper_id)
-            .fetch_optional(&self.pool)
+            .execute(&self.pool)
             .await?;
-        Ok(row.and_then(|r| r.try_get::<Option<String>, _>("pdf_url").ok().flatten()))
+        Ok(())
     }
 
     /// Look up a cached full-text extraction. Returns (markdown, error) — either may be Some,

@@ -211,8 +211,16 @@ The pipeline auto-detects which parser is on `PATH`, preferring `marker_single` 
 | `pdftotext` (default fallback) | Plain text. Tables/math get scrambled. Fast (~0.5s/paper). | `brew install poppler` / `apt install poppler-utils` / `winget install poppler` |
 | `marker_single` (preferred) | Markdown with tables/equations preserved, figures saved alongside. ML-based, GPU-accelerated. ~5-15s/paper on CUDA. | `pip install marker-pdf` (first run downloads ~1.5GB of models) |
 
+**PDF URL resolution at read time.** When `papers.pdf_url` is NULL — typical for paywalled-by-publisher papers, or rows ingested before the column existed — `read_paper` runs a four-step resolver chain before giving up:
+
+1. **arXiv DOI pattern** — DOIs of the form `10.48550/arXiv.X` decode to a direct PDF link with no HTTP call.
+2. **Unpaywall** (`api.unpaywall.org/v2/{doi}?email=...`) — aggregates legitimately-free PDF locations across arXiv, institutional repos, journal-published OA, and author homepages. Free, requires email (reuses `OPENALEX_EMAIL`).
+3. **arXiv title search** (`export.arxiv.org/api/query?search_query=ti:...`) — catches papers with arXiv preprints that OpenAlex didn't link to. Match must clear a Jaccard title-similarity threshold and an author last-name check.
+4. **Semantic Scholar** (`api.semanticscholar.org/graph/v1/paper/DOI:.../?fields=openAccessPdf`) — covers the residual gap. Optional `SEMANTIC_SCHOLAR_API_KEY` for higher rate limits.
+
+When any step finds a URL, it's UPDATEd into `papers.pdf_url` so future reads skip the resolver entirely. If all four steps fail, the paper is genuinely paywall-only and `read_paper` returns an explanatory error.
+
 **Caveats:**
-- Only works for papers with a `pdf_url` populated at ingest time. Older rows ingested before the column was added (commit `c3e5e7f`) will return an error until backfilled.
 - Failed extractions (404'd PDFs, paywalled, parser crashes) are cached as errors in `paper_full_text`. Delete the row to retry: `DELETE FROM paper_full_text WHERE paper_id = 'openalex:...'`.
 - Marker uses CUDA, so heavy tier-2 reads will contend with the harrier embedding model. Don't run bulk ingest and bulk reads in parallel.
 

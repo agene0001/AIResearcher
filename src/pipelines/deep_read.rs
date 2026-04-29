@@ -184,13 +184,34 @@ pub async fn read_paper(paper_id: &str) -> Result<String> {
         }
     }
 
-    let pdf_url = db.get_pdf_url(paper_id).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no pdf_url stored for paper {}. Older rows ingested before the pdf_url column \
-             will need a backfill pass before they can be deep-read.",
-            paper_id
-        )
-    })?;
+    // Fetch full resolver-relevant metadata (DOI, title, first author) so we
+    // can fall back to external services when papers.pdf_url is NULL.
+    let meta = db
+        .get_paper_resolver_meta(paper_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("paper {} not found in DB", paper_id))?;
+
+    let pdf_url = match meta.pdf_url.clone() {
+        Some(url) => url,
+        None => {
+            tracing::info!(paper_id = %paper_id, "pdf_url is NULL; running resolver chain");
+            match crate::pipelines::pdf_resolver::resolve_pdf_url(&meta).await? {
+                Some(url) => {
+                    // Cache the discovery so future reads skip the resolver entirely.
+                    if let Err(e) = db.update_pdf_url(paper_id, &url).await {
+                        tracing::warn!(error = ?e, "failed to cache resolved pdf_url");
+                    }
+                    url
+                }
+                None => anyhow::bail!(
+                    "no PDF URL found for paper {}. Tried OpenAlex (NULL), arXiv DOI \
+                     pattern, Unpaywall, arXiv title search, Semantic Scholar — none had \
+                     a free copy. The paper may be paywall-only.",
+                    paper_id
+                ),
+            }
+        }
+    };
 
     let temp_dir: PathBuf =
         std::env::temp_dir().join(format!("autoresearch-pdf-{}", sanitize_id(paper_id)));
