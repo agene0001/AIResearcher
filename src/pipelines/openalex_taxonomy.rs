@@ -59,16 +59,18 @@ impl Taxonomy {
 async fn fetch_all(client: &reqwest::Client, base_url: &str) -> Result<Vec<(u32, String)>> {
     let mut out = Vec::new();
     let mut cursor = "*".to_string();
+    let mailto_qs = std::env::var("OPENALEX_EMAIL")
+        .ok()
+        .filter(|e| !e.is_empty())
+        .map(|e| format!("&mailto={}", e))
+        .unwrap_or_default();
+
     loop {
-        let url = format!("{}?per_page=200&cursor={}", base_url, cursor);
-        let page: Page = client
-            .get(&url)
-            .header("User-Agent", "autoresearch-lab/0.1 (research tool)")
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let url = format!(
+            "{}?per_page=200&cursor={}{}",
+            base_url, cursor, mailto_qs,
+        );
+        let page: Page = fetch_page_with_retry(client, &url).await?;
         for e in page.results {
             // e.id looks like "https://openalex.org/subfields/1702"
             if let Some(id) = e.id.rsplit('/').next().and_then(|s| s.parse::<u32>().ok()) {
@@ -81,6 +83,60 @@ async fn fetch_all(client: &reqwest::Client, base_url: &str) -> Result<Vec<(u32,
         }
     }
     Ok(out)
+}
+
+/// Retry-aware fetch for taxonomy pages. Honors `Retry-After` on 429, and
+/// exponential-backoffs on transient network errors. Capped at 8 attempts —
+/// taxonomy is small, no point spinning forever.
+async fn fetch_page_with_retry(client: &reqwest::Client, url: &str) -> Result<Page> {
+    let mut attempt: u32 = 0;
+    loop {
+        let res = client
+            .get(url)
+            .header("User-Agent", "autoresearch-lab/0.1 (research tool)")
+            .send()
+            .await;
+
+        let resp = match res {
+            Ok(r) => r,
+            Err(e) => {
+                attempt += 1;
+                if attempt > 8 {
+                    return Err(e.into());
+                }
+                let delay = retry_delay(attempt);
+                tracing::warn!(attempt = attempt, delay_s = delay, error = ?e, "taxonomy fetch error, retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                continue;
+            }
+        };
+
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            attempt += 1;
+            if attempt > 8 {
+                return Err(anyhow::anyhow!("taxonomy fetch: 429 after 8 retries"));
+            }
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            let delay = retry_after.unwrap_or_else(|| retry_delay(attempt));
+            tracing::warn!(attempt = attempt, delay_s = delay, retry_after = ?retry_after, "taxonomy 429, retrying");
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            continue;
+        }
+
+        let resp = resp.error_for_status()?;
+        let page: Page = resp.json().await?;
+        return Ok(page);
+    }
+}
+
+/// Same exponential schedule used by ingest: 5, 10, 20, 40, 80, 160, 300, 300...
+fn retry_delay(attempt: u32) -> u64 {
+    let shift = attempt.min(6);
+    (5u64.saturating_mul(1u64 << shift)).min(300)
 }
 
 fn resolve(entries: &[(u32, String)], name: &str, kind: &str) -> Result<u32> {
