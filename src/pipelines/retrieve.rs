@@ -197,7 +197,7 @@ pub async fn retrieve_papers(query: &str) -> Result<Vec<Paper>> {
 
 /// Rerank papers by semantic similarity to the query using harrier embeddings.
 /// Papers without abstracts are pushed to the end.
-async fn semantic_rerank(query: &str, mut papers: Vec<Paper>) -> Vec<Paper> {
+async fn semantic_rerank(query: &str, papers: Vec<Paper>) -> Vec<Paper> {
     // Only rerank papers that have abstracts
     let papers_with_abstracts: Vec<&Paper> = papers.iter()
         .filter(|p| !p.abstract_text.is_empty())

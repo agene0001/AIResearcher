@@ -122,6 +122,14 @@ async fn fetch_page_with_retry(client: &reqwest::Client, url: &str) -> Result<Pa
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
             let delay = retry_after.unwrap_or_else(|| retry_delay(attempt));
+            // No progress bar yet at this point in startup, so eprintln is safe
+            // and gives visible feedback that the binary is patiently waiting.
+            eprintln!(
+                "OpenAlex taxonomy 429 (attempt {}). Sleeping {}s{} before retry...",
+                attempt,
+                delay,
+                if retry_after.is_some() { " (server-requested)" } else { "" },
+            );
             tracing::warn!(attempt = attempt, delay_s = delay, retry_after = ?retry_after, "taxonomy 429, retrying");
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
             continue;

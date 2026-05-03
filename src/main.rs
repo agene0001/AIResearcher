@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
             // Resolve --field/--subfield against OpenAlex's live taxonomy into numeric IDs.
             // Default when neither is set: the "Computer Science" field.
             let client = reqwest::Client::new();
+            println!("Loading OpenAlex taxonomy (fields + subfields)... if this hangs, check logs/ for retry warnings.");
             let taxonomy = crate::pipelines::openalex_taxonomy::Taxonomy::fetch(&client).await?;
             let topic_filter = if !subfield.is_empty() {
                 TopicFilter::Subfields(taxonomy.resolve_subfields(&subfield)?)
