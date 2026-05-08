@@ -24,10 +24,22 @@ fn is_oom_error(err: &anyhow::Error) -> bool {
     s.contains("out of memory") || s.contains("OUT_OF_MEMORY")
 }
 
+/// Detect CUDA illegal-address errors. Once these fire, the entire CUDA
+/// context is poisoned: every subsequent op returns the same error and the
+/// only fix is to drop the cached embedder and re-initialize.
+fn is_illegal_address_error(err: &anyhow::Error) -> bool {
+    let s = format!("{:#}", err);
+    s.contains("ILLEGAL_ADDRESS") || s.contains("illegal memory access")
+}
+
 const RETRIEVAL_INSTRUCTION: &str =
     "Instruct: Given a research query, retrieve relevant academic papers that address the query\nQuery: ";
 
-static EMBEDDER: std::sync::OnceLock<Mutex<HarrierEmbedder>> = std::sync::OnceLock::new();
+/// Lazy-initialized, replaceable embedder. We can't use `OnceLock` because
+/// CUDA contexts can become poisoned (illegal-address) after long uptime, in
+/// which case the cached embedder needs to be torn down and rebuilt — see
+/// `with_embedder_recoverable` below.
+static EMBEDDER: Mutex<Option<HarrierEmbedder>> = Mutex::new(None);
 
 pub struct HarrierEmbedder {
     /// Stored tensors (with "model." prefix) for recreating the model with fresh KV cache.
@@ -255,7 +267,7 @@ impl HarrierEmbedder {
     }
 }
 
-fn init_embedder() -> Result<Mutex<HarrierEmbedder>> {
+fn init_embedder_inner() -> Result<HarrierEmbedder> {
     eprintln!("Loading harrier-oss-v1-0.6b embedding model (first run downloads ~1.2GB)...");
 
     #[cfg(feature = "cuda")]
@@ -293,40 +305,83 @@ fn init_embedder() -> Result<Mutex<HarrierEmbedder>> {
 
     eprintln!("Harrier embedding model loaded on {:?}", device);
 
-    Ok(Mutex::new(HarrierEmbedder {
+    Ok(HarrierEmbedder {
         tensors,
         config,
         tokenizer,
         device,
         dtype,
-    }))
+    })
 }
 
-fn get_embedder() -> Result<&'static Mutex<HarrierEmbedder>> {
-    let embedder = EMBEDDER.get_or_init(|| {
-        init_embedder().expect("Failed to load harrier embedding model")
-    });
-    Ok(embedder)
+/// Lock the embedder mutex, lazily initialize if absent, and run `f` against it.
+/// Holds the lock for the duration of the call.
+fn lock_and_call<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce(&HarrierEmbedder) -> Result<T>,
+{
+    let mut guard = EMBEDDER
+        .lock()
+        .map_err(|e| anyhow::anyhow!("Embedder lock poisoned: {}", e))?;
+    if guard.is_none() {
+        *guard = Some(init_embedder_inner()?);
+    }
+    f(guard.as_ref().expect("just initialized"))
+}
+
+/// Drop the cached embedder and rebuild it from scratch. Called when CUDA
+/// reports an illegal-address error, which permanently poisons the context
+/// until the embedder's tensor handles are released and a fresh device +
+/// model is created.
+fn rebuild_embedder() -> Result<()> {
+    let mut guard = EMBEDDER
+        .lock()
+        .map_err(|e| anyhow::anyhow!("Embedder lock poisoned: {}", e))?;
+    *guard = None; // releases all candle Tensor handles → CUDA refs drop
+    // Brief pause to let driver-side cleanup settle. Doesn't truly fix a dead
+    // context — just makes the next allocation marginally less racy.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    *guard = Some(init_embedder_inner()?);
+    Ok(())
+}
+
+/// Run `op_label` against the embedder. On CUDA illegal-address, log loudly,
+/// rebuild the embedder, and retry once. Other errors propagate as-is.
+/// Closure must be `Fn` so we can call it twice.
+fn with_embedder_recoverable<F, T>(op_label: &str, op: F) -> Result<T>
+where
+    F: Fn(&HarrierEmbedder) -> Result<T>,
+{
+    match lock_and_call(&op) {
+        Ok(out) => Ok(out),
+        Err(e) if is_illegal_address_error(&e) => {
+            eprintln!(
+                "CUDA context poisoned during {} ({}). Rebuilding harrier embedder and retrying once...",
+                op_label,
+                e
+            );
+            tracing::warn!(op = op_label, error = ?e, "CUDA illegal-address; rebuilding embedder");
+            rebuild_embedder()?;
+            eprintln!("Harrier embedder rebuilt; retrying {}.", op_label);
+            tracing::info!(op = op_label, "harrier embedder rebuilt after illegal-address");
+            lock_and_call(&op)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Generate an embedding for a query (with retrieval instruction).
 pub fn embed_query(query: &str) -> Result<Vec<f32>> {
     let text = format!("{}{}", RETRIEVAL_INSTRUCTION, query);
-    let embedder = get_embedder()?;
-    let lock = embedder.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-    lock.embed_single(&text)
+    with_embedder_recoverable("embed_query", |e| e.embed_single(&text))
 }
 
 /// Generate an embedding for a document (paper title + abstract, no instruction prefix).
 pub fn embed_document(text: &str) -> Result<Vec<f32>> {
-    let embedder = get_embedder()?;
-    let lock = embedder.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-    lock.embed_single(text)
+    with_embedder_recoverable("embed_document", |e| e.embed_single(text))
 }
 
 /// Embed a batch of documents in a single forward pass. Much faster than calling embed_document in a loop.
 pub fn embed_document_batch(texts: &[String]) -> Result<Vec<Vec<f32>>> {
-    let embedder = get_embedder()?;
-    let lock = embedder.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-    lock.embed_batch(texts)
+    with_embedder_recoverable("embed_document_batch", |e| e.embed_batch(texts))
 }
