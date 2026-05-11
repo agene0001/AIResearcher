@@ -18,7 +18,8 @@
       "Bash(git commit -m ' *)",
       "Bash(curl -sS \"https://api.openalex.org/fields?per_page=2\")",
       "Bash(curl -sS \"https://api.openalex.org/subfields?per_page=2&cursor=*\")",
-      "Bash(curl -sS \"https://api.openalex.org/subfields?search=sports&per_page=5\")"
+      "Bash(curl -sS \"https://api.openalex.org/subfields?search=sports&per_page=5\")",
+      "Bash(git commit *)"
     ]
   }
 }
