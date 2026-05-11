@@ -51,9 +51,24 @@ fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
     Ok(guard)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     dotenv().ok();
+
+    // Embedder-worker mode: same binary, separate process, owns the GPU.
+    // Spawned by `processing::harrier::HarrierClient::spawn`. Runs entirely
+    // synchronously — no tokio runtime, no parent logging — so a poisoned
+    // CUDA context dies with the child instead of corrupting the pipeline.
+    if std::env::args().skip(1).any(|a| a == crate::processing::harrier::WORKER_ARG) {
+        return crate::processing::harrier_worker::run();
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let _log_guard = init_logging()?;
     tracing::info!("autoresearch-lab starting");
 
