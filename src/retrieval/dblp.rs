@@ -1,10 +1,10 @@
 use anyhow::Result;
-use reqwest::Client;
+use crate::retrieval::HTTP;
 use crate::models::paper::{Paper, PaperSource};
 
 /// Search DBLP — the standard CS bibliography database. Free, reliable, no key needed.
 pub async fn search_dblp(query: &str, max_results: usize) -> Result<Vec<Paper>> {
-    let client = Client::new();
+    let client = &*HTTP;
     let limit = max_results.min(50);
 
     let url = format!(

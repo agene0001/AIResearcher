@@ -30,7 +30,6 @@ pub const WORKER_ARG: &str = "__harrier_worker__";
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Request<'a> {
     EmbedQuery { text: &'a str },
-    EmbedDocument { text: &'a str },
     EmbedDocumentBatch { texts: &'a [String] },
 }
 
@@ -173,18 +172,6 @@ pub fn embed_query(query: &str) -> Result<Vec<f32>> {
         Response::Error { message, .. } => anyhow::bail!("embed_query: {}", message),
         Response::Embeddings { .. } => {
             anyhow::bail!("embed_query: unexpected batch response from worker")
-        }
-    }
-}
-
-/// Generate an embedding for a document (paper title + abstract, no instruction prefix).
-pub fn embed_document(text: &str) -> Result<Vec<f32>> {
-    let resp = call_with_respawn(&Request::EmbedDocument { text })?;
-    match resp {
-        Response::Embedding { vector } => Ok(vector),
-        Response::Error { message, .. } => anyhow::bail!("embed_document: {}", message),
-        Response::Embeddings { .. } => {
-            anyhow::bail!("embed_document: unexpected batch response from worker")
         }
     }
 }

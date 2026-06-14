@@ -56,7 +56,6 @@ fn is_illegal_address_error(err: &anyhow::Error) -> bool {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     EmbedQuery { text: String },
-    EmbedDocument { text: String },
     EmbedDocumentBatch { texts: Vec<String> },
 }
 
@@ -73,12 +72,13 @@ pub enum Response {
 // ---------- Model ----------
 
 struct Embedder {
-    /// Stored tensors (with "model." prefix) for recreating the model with fresh KV cache.
-    tensors: HashMap<String, Tensor>,
-    config: Qwen3Config,
+    /// Persistent model, reused across forward passes. We reset its KV cache
+    /// between calls (cheap) instead of rebuilding the whole model — the old
+    /// `fresh_model()` path re-allocated the rotary position tables on the GPU
+    /// on every single embed.
+    model: Qwen3Model,
     tokenizer: Tokenizer,
     device: Device,
-    dtype: DType,
 }
 
 impl Embedder {
@@ -114,28 +114,21 @@ impl Embedder {
             tensors.insert(format!("model.{}", name), tensor);
         }
 
-        // Verify it works by creating one model instance
-        let vb = VarBuilder::from_tensors(tensors.clone(), dtype, &device);
-        let _test = Qwen3Model::new(&config, vb)?;
+        // Build the model once and keep it for the worker's lifetime; the KV
+        // cache is reset between forward passes via `clear_kv_cache()`.
+        let vb = VarBuilder::from_tensors(tensors, dtype, &device);
+        let model = Qwen3Model::new(&config, vb)?;
 
         eprintln!("Harrier embedding model loaded on {:?}", device);
 
         Ok(Self {
-            tensors,
-            config,
+            model,
             tokenizer,
             device,
-            dtype,
         })
     }
 
-    /// Create a fresh Model instance with empty KV cache.
-    fn fresh_model(&self) -> Result<Qwen3Model> {
-        let vb = VarBuilder::from_tensors(self.tensors.clone(), self.dtype, &self.device);
-        Ok(Qwen3Model::new(&self.config, vb)?)
-    }
-
-    fn embed_single(&self, text: &str) -> Result<Vec<f32>> {
+    fn embed_single(&mut self, text: &str) -> Result<Vec<f32>> {
         let encoding = self.tokenizer.encode(text, true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
         let token_ids = encoding.get_ids();
@@ -149,8 +142,8 @@ impl Embedder {
         let seq_len = token_ids.len();
         let input_ids = Tensor::new(token_ids, &self.device)?.unsqueeze(0)?;
 
-        let mut model = self.fresh_model()?;
-        let hidden_states = model.forward(&input_ids, 0)?;
+        self.model.clear_kv_cache();
+        let hidden_states = self.model.forward(&input_ids, 0)?;
 
         // Pool then normalize in fp32 — bf16 underflows in the L2 norm sum.
         let last_token = hidden_states
@@ -170,7 +163,7 @@ impl Embedder {
     /// Embed a batch of texts. Tokenizes everything, sorts by length, and packs
     /// sub-batches up to MAX_BATCH_TOKENS of padded tokens so one long outlier
     /// can't blow up GPU memory. Returns embeddings in the original input order.
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -178,16 +171,21 @@ impl Embedder {
             return Ok(vec![self.embed_single(&texts[0])?]);
         }
 
-        let mut items: Vec<(usize, Vec<u32>)> = texts.iter()
+        // Tokenize the whole batch in one call — `encode_batch` parallelizes
+        // across rayon threads internally, vs. the previous one-at-a-time loop.
+        // Pass &str (not owned String) so we don't clone every abstract first.
+        let inputs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let encodings = self.tokenizer
+            .encode_batch(inputs, true)
+            .map_err(|e| anyhow::anyhow!("Batch tokenization failed: {}", e))?;
+        let mut items: Vec<(usize, Vec<u32>)> = encodings.iter()
             .enumerate()
-            .map(|(i, text)| {
-                let encoding = self.tokenizer.encode(text.as_str(), true)
-                    .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
-                let ids = encoding.get_ids();
+            .map(|(i, enc)| {
+                let ids = enc.get_ids();
                 let ids = if ids.len() > 32768 { ids[..32768].to_vec() } else { ids.to_vec() };
-                Ok((i, ids))
+                (i, ids)
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
 
         items.sort_by_key(|(_, ids)| std::cmp::Reverse(ids.len()));
 
@@ -251,7 +249,7 @@ impl Embedder {
     /// the sub-batch until the forward pass fits in VRAM. At single-item granularity,
     /// falls back to truncating the input to OOM_TRUNCATION_TOKENS.
     /// Items are assumed to be sorted by length descending (so items[0] dictates max_len).
-    fn embed_sub_batch_recoverable(&self, items: &[(usize, Vec<u32>)]) -> Result<Vec<Vec<f32>>> {
+    fn embed_sub_batch_recoverable(&mut self, items: &[(usize, Vec<u32>)]) -> Result<Vec<Vec<f32>>> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -284,7 +282,7 @@ impl Embedder {
     }
 
     /// Run a single forward pass on a uniform sub-batch (already length-sorted, padded to max_len).
-    fn embed_sub_batch(&self, items: &[(usize, Vec<u32>)], max_len: usize) -> Result<Vec<Vec<f32>>> {
+    fn embed_sub_batch(&mut self, items: &[(usize, Vec<u32>)], max_len: usize) -> Result<Vec<Vec<f32>>> {
         let batch_size = items.len();
         let pad_token_id: u32 = 0;
 
@@ -299,8 +297,8 @@ impl Embedder {
         }
 
         let input_ids = Tensor::from_vec(batch_data, (batch_size, max_len), &self.device)?;
-        let mut model = self.fresh_model()?;
-        let hidden_states = model.forward(&input_ids, 0)?;
+        self.model.clear_kv_cache();
+        let hidden_states = self.model.forward(&input_ids, 0)?;
 
         let mut embeddings = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
@@ -341,7 +339,7 @@ fn write_response<W: Write>(w: &mut W, resp: &Response) -> Result<()> {
 /// respawn-on-failure logic kicks in with a fresh process (and thus a fresh
 /// CUDA context).
 pub fn run() -> Result<()> {
-    let embedder = match Embedder::load() {
+    let mut embedder = match Embedder::load() {
         Ok(e) => e,
         Err(e) => {
             // We can't even load — tell the parent and bail. Parent will see
@@ -393,9 +391,6 @@ pub fn run() -> Result<()> {
             Request::EmbedQuery { text } => {
                 let full = format!("{}{}", RETRIEVAL_INSTRUCTION, text);
                 embedder.embed_single(&full).map(|v| Response::Embedding { vector: v })
-            }
-            Request::EmbedDocument { text } => {
-                embedder.embed_single(&text).map(|v| Response::Embedding { vector: v })
             }
             Request::EmbedDocumentBatch { texts } => {
                 embedder.embed_batch(&texts).map(|v| Response::Embeddings { vectors: v })
