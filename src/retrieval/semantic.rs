@@ -1,11 +1,11 @@
 use anyhow::Result;
-use reqwest::Client;
+use crate::retrieval::HTTP;
 use crate::models::paper::{Paper, PaperSource};
 
 /// Search Semantic Scholar's public API.
 /// Free without a key (rate-limited to ~100 req/5 min). Set SEMANTIC_SCHOLAR_API_KEY for higher limits.
 pub async fn search_semantic_scholar(query: &str, max_results: usize) -> Result<Vec<Paper>> {
-    let client = Client::new();
+    let client = &*HTTP;
     let limit = max_results.min(100); // API max is 100
 
     let mut req = client

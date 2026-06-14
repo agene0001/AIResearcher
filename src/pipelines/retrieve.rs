@@ -8,7 +8,7 @@ use crate::retrieval::openalex::search_openalex;
 use crate::retrieval::crossref::search_crossref;
 use crate::retrieval::dblp::search_dblp;
 use crate::storage::postgres::DbClient;
-use crate::processing::embedding::{generate_embedding, generate_document_embedding};
+use crate::processing::embedding::{generate_embedding, generate_document_embeddings_batch};
 use crate::llm::client::{cheap_config, chat_completion};
 
 const PER_PROVIDER_LIMIT: usize = 20;
@@ -136,115 +136,115 @@ pub async fn retrieve_papers(query: &str) -> Result<Vec<Paper>> {
 
     tracing::info!("Total papers after deduplication: {}", all_papers.len());
 
-    // Try to use the database for hybrid search and indexing
-    if let Some(db) = DbClient::try_new().await {
-        // Index the freshly retrieved papers in the background
-        let papers_to_index: Vec<Paper> = all_papers.iter()
-            .filter(|p| !p.abstract_text.is_empty())
-            .cloned()
-            .collect();
-
-        if !papers_to_index.is_empty() {
-            let db_clone = db.clone();
-            tokio::spawn(async move {
-                for paper in &papers_to_index {
-                    let text = format!("{} {}", paper.title, paper.abstract_text);
-                    match generate_document_embedding(&text).await {
-                        Ok(embedding) => {
-                            if let Err(e) = db_clone.insert_paper(paper, embedding).await {
-                                tracing::warn!("Failed to index paper {}: {}", paper.id, e);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to embed paper {}: {}", paper.id, e);
-                        }
-                    }
-                }
-                tracing::info!("Indexed {} papers in background", papers_to_index.len());
-            });
+    // Embed the query ONCE — reused for both DB hybrid search and reranking
+    // (it was previously embedded separately in each).
+    let query_embedding = match generate_embedding(query).await {
+        Ok(e) => Some(e),
+        Err(e) => {
+            tracing::warn!("Failed to generate query embedding: {}", e);
+            None
         }
+    };
 
-        // Also do a hybrid search on existing indexed papers to supplement results
-        match generate_embedding(query).await {
-            Ok(query_embedding) => {
-                match db.hybrid_search(query, query_embedding, 20).await {
-                    Ok(db_papers) => {
-                        tracing::info!("Hybrid search returned {} papers from DB", db_papers.len());
-                        for paper in db_papers {
-                            let norm_title = normalize_title(&paper.title);
-                            if let Some(ref doi) = paper.doi {
-                                if !seen_dois.insert(doi.to_lowercase()) {
-                                    continue;
-                                }
-                            }
-                            if seen_titles.insert(norm_title) {
-                                all_papers.push(paper);
-                            }
+    let db = DbClient::try_new().await;
+    // Papers from external providers come first; DB-supplemented papers are
+    // appended below. We only background-index the provider-origin ones.
+    let provider_count = all_papers.len();
+
+    // Supplement results with a hybrid search over already-indexed papers.
+    if let (Some(db), Some(qemb)) = (db.as_ref(), query_embedding.as_ref()) {
+        match db.hybrid_search(query, qemb.clone(), 20).await {
+            Ok(db_papers) => {
+                tracing::info!("Hybrid search returned {} papers from DB", db_papers.len());
+                for paper in db_papers {
+                    let norm_title = normalize_title(&paper.title);
+                    if let Some(ref doi) = paper.doi {
+                        if !seen_dois.insert(doi.to_lowercase()) {
+                            continue;
                         }
                     }
-                    Err(e) => tracing::warn!("Hybrid search failed: {}", e),
+                    if seen_titles.insert(norm_title) {
+                        all_papers.push(paper);
+                    }
                 }
             }
-            Err(e) => tracing::warn!("Failed to generate query embedding: {}", e),
+            Err(e) => tracing::warn!("Hybrid search failed: {}", e),
         }
     }
 
-    // Semantic reranking: score papers by embedding similarity to the original query
-    all_papers = semantic_rerank(query, all_papers).await;
+    // Embed every paper with an abstract ONCE, in a single batched forward pass,
+    // then reuse those vectors for both background indexing and reranking.
+    // Previously each paper was embedded twice (index + rerank), one at a time.
+    let abstract_idx: Vec<usize> = all_papers.iter().enumerate()
+        .filter(|(_, p)| !p.abstract_text.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+    let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; all_papers.len()];
+    if !abstract_idx.is_empty() {
+        let texts: Vec<String> = abstract_idx.iter()
+            .map(|&i| format!("{} {}", all_papers[i].title, all_papers[i].abstract_text))
+            .collect();
+        match generate_document_embeddings_batch(texts).await {
+            Ok(embs) => {
+                for (&i, emb) in abstract_idx.iter().zip(embs) {
+                    embeddings[i] = Some(emb);
+                }
+            }
+            Err(e) => tracing::warn!("Batch embedding failed (index + rerank skipped): {}", e),
+        }
+    }
+
+    // Background-index the provider-origin papers, reusing the embeddings we
+    // just computed (no re-embedding).
+    if let Some(db) = db {
+        let to_index: Vec<(Paper, Vec<f32>)> = abstract_idx.iter()
+            .filter(|&&i| i < provider_count)
+            .filter_map(|&i| embeddings[i].as_ref().map(|e| (all_papers[i].clone(), e.clone())))
+            .collect();
+        if !to_index.is_empty() {
+            tokio::spawn(async move {
+                for (paper, emb) in &to_index {
+                    if let Err(e) = db.insert_paper(paper, emb.clone()).await {
+                        tracing::warn!("Failed to index paper {}: {}", paper.id, e);
+                    }
+                }
+                tracing::info!("Indexed {} papers in background", to_index.len());
+            });
+        }
+    }
+
+    // Rerank by cosine similarity to the query, reusing the per-paper
+    // embeddings. Papers without an abstract sort to the end.
+    if let Some(qemb) = query_embedding {
+        all_papers = rerank_by_embedding(all_papers, embeddings, &qemb);
+    }
 
     Ok(all_papers)
 }
 
-/// Rerank papers by semantic similarity to the query using harrier embeddings.
-/// Papers without abstracts are pushed to the end.
-async fn semantic_rerank(query: &str, papers: Vec<Paper>) -> Vec<Paper> {
-    // Only rerank papers that have abstracts
-    let papers_with_abstracts: Vec<&Paper> = papers.iter()
-        .filter(|p| !p.abstract_text.is_empty())
+/// Rerank papers by cosine similarity to the query, using pre-computed
+/// per-paper embeddings (aligned to `papers` by index; `None` means no abstract,
+/// which sorts to the end). No embedding work happens here — the vectors are
+/// computed once by the caller and shared with the indexing path.
+fn rerank_by_embedding(
+    papers: Vec<Paper>,
+    embeddings: Vec<Option<Vec<f32>>>,
+    query_embedding: &[f32],
+) -> Vec<Paper> {
+    let mut scored: Vec<(Paper, f32)> = papers
+        .into_iter()
+        .zip(embeddings)
+        .map(|(p, emb)| {
+            let score = emb
+                .as_ref()
+                .map(|e| cosine_similarity(query_embedding, e))
+                .unwrap_or(-1.0);
+            (p, score)
+        })
         .collect();
 
-    if papers_with_abstracts.is_empty() {
-        return papers;
-    }
-
-    // Generate query embedding
-    let query_embedding = match generate_embedding(query).await {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("  Reranking skipped (embedding error): {}", e);
-            return papers;
-        }
-    };
-
-    // Score each paper by cosine similarity
-    let mut scored: Vec<(usize, f32)> = Vec::new();
-    for (idx, paper) in papers.iter().enumerate() {
-        if paper.abstract_text.is_empty() {
-            scored.push((idx, -1.0)); // Push to end
-            continue;
-        }
-
-        let text = format!("{} {}", paper.title, paper.abstract_text);
-        match generate_document_embedding(&text).await {
-            Ok(doc_embedding) => {
-                let sim = cosine_similarity(&query_embedding, &doc_embedding);
-                scored.push((idx, sim));
-            }
-            Err(_) => {
-                scored.push((idx, -1.0));
-            }
-        }
-    }
-
-    // Sort by similarity descending
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Rebuild papers vec in ranked order
-    let reranked: Vec<Paper> = scored.into_iter()
-        .map(|(idx, _)| papers[idx].clone())
-        .collect();
-
-    reranked
+    scored.into_iter().map(|(p, _)| p).collect()
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {

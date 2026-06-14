@@ -15,7 +15,7 @@ tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 # DB
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
+sqlx = { version = "0.9", features = ["postgres", "runtime-tokio"] }
 
 # optional
 clap = { version = "4.6.1", features = ["derive"] }
@@ -33,12 +33,44 @@ candle-core = "0.10.2"
 candle-nn = "0.10.2"
 candle-transformers = "0.10.2"
 hf-hub = "0.5.0"
-tokenizers = "0.22.2"
+tokenizers = "0.23.1"
 
 [features]
 default = []
 metal = ["candle-transformers/metal"]   # macOS GPU acceleration (propagates to candle-core + candle-nn)
 cuda = ["candle-transformers/cuda"]     # Windows/Linux Nvidia GPU acceleration
+
+# ---------------------------------------------------------------------------
+# Build profiles
+# ---------------------------------------------------------------------------
+
+# Optimize dependencies even in `dev` builds. Your own crate stays at opt-level 0
+# (fast incremental compiles + good debugging), while heavy deps like candle run
+# at full speed — without this, `cargo run` embedding/ingest is painfully slow.
+[profile.dev.package."*"]
+opt-level = 3
+
+# `cargo build --release`: optimized with balanced compile time. Good for
+# profiling and everyday optimized runs.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = "debuginfo"
+
+# `cargo build --profile production`: the ship build. Maximum runtime
+# performance and smallest binary, at the cost of much slower compiles.
+# Inherits everything from `release`, then turns the dials to max.
+# Output lands in target/production/ (NOT target/release/).
+# Note: `panic = "abort"` is safe here because CUDA recovery is process-based
+# (the harrier worker respawns); remove it if you ever add in-process
+# panic recovery (catch_unwind / JoinHandle::is_panic).
+[profile.production]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
 
 # Temporary fork with causal-mask batch fix (pending upstream PR).
 # Remove once https://github.com/huggingface/candle/pull/3484 is merged.

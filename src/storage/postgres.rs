@@ -290,39 +290,50 @@ impl DbClient {
         Ok(rows.into_iter().map(|r| r.get::<String, _>("id")).collect())
     }
 
-    /// Batch insert papers with embeddings. Much faster than individual inserts.
+    /// Batch insert papers with embeddings using multi-row INSERTs.
+    ///
+    /// Each statement packs up to `MAX_ROWS_PER_INSERT` rows in a single
+    /// `INSERT ... VALUES (..), (..), ..` — one server round-trip per chunk
+    /// instead of one per paper. Chunked to stay under Postgres' 65535
+    /// bind-parameter cap (11 columns × rows), and wrapped in a transaction so
+    /// a multi-chunk batch still commits atomically.
     pub async fn insert_papers_batch(&self, papers: &[Paper], embeddings: &[Vec<f32>]) -> Result<()> {
         if papers.is_empty() {
             return Ok(());
         }
 
-        // Use a transaction for atomicity and speed
+        // 11 columns per row; 1000 rows = 11k binds, comfortably under PG's 65535 cap.
+        const MAX_ROWS_PER_INSERT: usize = 1000;
+
         let mut tx = self.pool.begin().await?;
 
-        for (paper, embedding) in papers.iter().zip(embeddings.iter()) {
-            let vector = Vector::from(embedding.clone());
-            let authors_json = serde_json::to_value(&paper.authors)?;
-
-            sqlx::query(
-                r#"
-                INSERT INTO papers (id, title, abstract_text, content, source, year, doi, url, pdf_url, authors, embedding)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                ON CONFLICT DO NOTHING
-                "#
-            )
-            .bind(&paper.id)
-            .bind(&paper.title)
-            .bind(&paper.abstract_text)
-            .bind(&paper.content)
-            .bind(paper.source.to_string())
-            .bind(paper.year.map(|y| y as i32))
-            .bind(&paper.doi)
-            .bind(&paper.url)
-            .bind(&paper.pdf_url)
-            .bind(&authors_json)
-            .bind(vector)
-            .execute(&mut *tx)
-            .await?;
+        for (pchunk, echunk) in papers
+            .chunks(MAX_ROWS_PER_INSERT)
+            .zip(embeddings.chunks(MAX_ROWS_PER_INSERT))
+        {
+            let mut qb = sqlx::QueryBuilder::<Postgres>::new(
+                "INSERT INTO papers \
+                 (id, title, abstract_text, content, source, year, doi, url, pdf_url, authors, embedding) ",
+            );
+            qb.push_values(pchunk.iter().zip(echunk.iter()), |mut b, (paper, embedding)| {
+                // Vec<String> -> JSON can't realistically fail; fall back to [] to
+                // keep this closure infallible (push_values can't propagate Result).
+                let authors_json = serde_json::to_value(&paper.authors)
+                    .unwrap_or_else(|_| serde_json::json!([]));
+                b.push_bind(&paper.id)
+                    .push_bind(&paper.title)
+                    .push_bind(&paper.abstract_text)
+                    .push_bind(&paper.content)
+                    .push_bind(paper.source.to_string())
+                    .push_bind(paper.year.map(|y| y as i32))
+                    .push_bind(&paper.doi)
+                    .push_bind(&paper.url)
+                    .push_bind(&paper.pdf_url)
+                    .push_bind(authors_json)
+                    .push_bind(Vector::from(embedding.clone()));
+            });
+            qb.push(" ON CONFLICT DO NOTHING");
+            qb.build().execute(&mut *tx).await?;
         }
 
         tx.commit().await?;

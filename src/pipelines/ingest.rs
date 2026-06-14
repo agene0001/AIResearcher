@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
+use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -42,9 +45,85 @@ impl TopicFilter {
     }
 }
 
-fn extract_openalex_id(obj: &serde_json::Value) -> Option<u32> {
-    obj.get("id")
-        .and_then(|i| i.as_str())
+// ---------------------------------------------------------------------------
+// Typed OpenAlex work schema (only the fields we use).
+//
+// Deserializing straight into these structs skips building a `serde_json::Value`
+// DOM for every record — faster and far less allocation on the snapshot hot path
+// (2M+ records, most filtered out). Every field is optional so missing/null
+// values degrade gracefully instead of failing the whole record.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct Work {
+    id: Option<String>,
+    title: Option<String>,
+    doi: Option<String>,
+    publication_year: Option<u32>,
+    abstract_inverted_index: Option<HashMap<String, Vec<u32>>>,
+    authorships: Option<Vec<Authorship>>,
+    topics: Option<Vec<Topic>>,
+    best_oa_location: Option<Location>,
+    primary_location: Option<Location>,
+    locations: Option<Vec<Location>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct Authorship {
+    author: Option<Author>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct Author {
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct Topic {
+    field: Option<OaEntity>,
+    subfield: Option<OaEntity>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct OaEntity {
+    id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct Location {
+    pdf_url: Option<String>,
+    landing_page_url: Option<String>,
+    is_oa: Option<bool>,
+}
+
+/// One page of the OpenAlex `/works` API response.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ApiResponse {
+    meta: Option<Meta>,
+    /// Kept as raw values, not `Vec<Work>`, so a single malformed record can't
+    /// fail the whole-page deserialize (which would hang the retry loop). Each
+    /// is decoded into `Work` independently where it's consumed.
+    results: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct Meta {
+    count: Option<u64>,
+    next_cursor: Option<String>,
+}
+
+/// Parse the trailing numeric id out of an OpenAlex entity URL
+/// (`https://openalex.org/subfields/1702` -> `1702`).
+fn entity_numeric_id(e: &OaEntity) -> Option<u32> {
+    e.id.as_deref()
         .and_then(|s| s.rsplit('/').next())
         .and_then(|s| s.parse::<u32>().ok())
 }
@@ -117,100 +196,163 @@ fn derive_pdf_from_landing(landing: &str) -> Option<String> {
 ///      `landing_page_url` for arXiv / ACL / OpenReview / bioRxiv when OpenAlex
 ///      left `pdf_url` itself null — they very often do this for arXiv abstracts
 ///      even though the PDF is a one-line URL transform away.
-pub fn extract_pdf_url(work: &serde_json::Value) -> Option<String> {
-    let pick_direct = |loc: &serde_json::Value| -> Option<String> {
-        loc.get("pdf_url")
-            .and_then(|u| u.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+fn extract_pdf_url(work: &Work) -> Option<String> {
+    let pick_direct = |loc: &Location| -> Option<String> {
+        loc.pdf_url.as_deref().filter(|s| !s.is_empty()).map(|s| s.to_string())
     };
-    let pick_derived = |loc: &serde_json::Value| -> Option<String> {
-        loc.get("landing_page_url")
-            .and_then(|u| u.as_str())
-            .and_then(derive_pdf_from_landing)
+    let pick_derived = |loc: &Location| -> Option<String> {
+        loc.landing_page_url.as_deref().and_then(derive_pdf_from_landing)
     };
 
+    let curated = [work.best_oa_location.as_ref(), work.primary_location.as_ref()];
+    let locations = work.locations.as_deref().unwrap_or(&[]);
+
     // Pass 1: direct pdf_url across curated picks + locations[]
-    for key in ["best_oa_location", "primary_location"] {
-        if let Some(loc) = work.get(key).filter(|v| !v.is_null()) {
-            if let Some(url) = pick_direct(loc) {
-                return Some(url);
-            }
+    for loc in curated.into_iter().flatten() {
+        if let Some(url) = pick_direct(loc) {
+            return Some(url);
         }
     }
-    if let Some(locations) = work.get("locations").and_then(|l| l.as_array()) {
-        for loc in locations {
-            if loc.get("is_oa").and_then(|b| b.as_bool()).unwrap_or(false) {
-                if let Some(url) = pick_direct(loc) {
-                    return Some(url);
-                }
-            }
+    for loc in locations.iter().filter(|l| l.is_oa.unwrap_or(false)) {
+        if let Some(url) = pick_direct(loc) {
+            return Some(url);
         }
-        for loc in locations {
-            if let Some(url) = pick_direct(loc) {
-                return Some(url);
-            }
+    }
+    for loc in locations {
+        if let Some(url) = pick_direct(loc) {
+            return Some(url);
         }
     }
 
     // Pass 2: derive from landing_page_url for known patterns
-    for key in ["best_oa_location", "primary_location"] {
-        if let Some(loc) = work.get(key).filter(|v| !v.is_null()) {
-            if let Some(url) = pick_derived(loc) {
-                return Some(url);
-            }
+    for loc in curated.into_iter().flatten() {
+        if let Some(url) = pick_derived(loc) {
+            return Some(url);
         }
     }
-    if let Some(locations) = work.get("locations").and_then(|l| l.as_array()) {
-        for loc in locations {
-            if loc.get("is_oa").and_then(|b| b.as_bool()).unwrap_or(false) {
-                if let Some(url) = pick_derived(loc) {
-                    return Some(url);
-                }
-            }
+    for loc in locations.iter().filter(|l| l.is_oa.unwrap_or(false)) {
+        if let Some(url) = pick_derived(loc) {
+            return Some(url);
         }
-        for loc in locations {
-            if let Some(url) = pick_derived(loc) {
-                return Some(url);
-            }
+    }
+    for loc in locations {
+        if let Some(url) = pick_derived(loc) {
+            return Some(url);
         }
     }
 
     None
 }
 
-/// Check if a snapshot work's `topics[]` array contains a topic whose
-/// field/subfield matches the filter.
-fn matches_topic_filter(work: &serde_json::Value, filter: &TopicFilter) -> bool {
-    let topics = match work.get("topics").and_then(|t| t.as_array()) {
-        Some(t) => t,
-        None => return false,
-    };
-    for topic in topics {
-        match filter {
-            TopicFilter::Field(id) => {
-                if let Some(obj) = topic.get("field") {
-                    if extract_openalex_id(obj) == Some(*id) {
-                        return true;
-                    }
-                }
-            }
-            TopicFilter::Subfields(ids) => {
-                if let Some(obj) = topic.get("subfield") {
-                    if let Some(sid) = extract_openalex_id(obj) {
-                        if ids.contains(&sid) {
-                            return true;
-                        }
-                    }
-                }
-            }
+/// Check whether a work's `topics[]` contains a topic matching the filter.
+fn matches_topic_filter(topics: &[Topic], filter: &TopicFilter) -> bool {
+    topics.iter().any(|t| match filter {
+        TopicFilter::Field(id) => t.field.as_ref().and_then(entity_numeric_id) == Some(*id),
+        TopicFilter::Subfields(ids) => t
+            .subfield
+            .as_ref()
+            .and_then(entity_numeric_id)
+            .map_or(false, |sid| ids.contains(&sid)),
+    })
+}
+
+/// Build a `Paper` from a parsed OpenAlex work. Returns `None` (skip) when the
+/// work has no title, or — when `require_abstract` — no usable abstract.
+/// Shared by the snapshot ingest, API ingest, and the `search_openalex`
+/// retrieval path.
+pub(crate) fn paper_from_work(work: &Work, require_abstract: bool) -> Option<Paper> {
+    let title = work.title.as_deref().filter(|t| !t.is_empty())?;
+
+    let abstract_text = work
+        .abstract_inverted_index
+        .as_ref()
+        .map(reconstruct_abstract)
+        .unwrap_or_default();
+    if require_abstract && abstract_text.is_empty() {
+        return None;
+    }
+
+    let openalex_id = work.id.as_deref().unwrap_or("");
+    let short_id = openalex_id.rsplit('/').next().unwrap_or(openalex_id);
+    let doi = work.doi.as_deref().map(|s| s.replace("https://doi.org/", ""));
+
+    let authors: Vec<String> = work
+        .authorships
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|a| a.author.as_ref()?.display_name.clone())
+        .collect();
+
+    let pdf_url = extract_pdf_url(work);
+
+    Some(Paper {
+        id: format!("openalex:{}", short_id),
+        title: title.to_string(),
+        abstract_text,
+        content: None,
+        source: PaperSource::OpenAlex,
+        year: work.publication_year,
+        doi,
+        url: Some(openalex_id.to_string()),
+        pdf_url,
+        authors,
+    })
+}
+
+/// Read, decompress and parse one OpenAlex snapshot `.gz` part file, applying
+/// the snapshot-only filters (abstract present, year, topic). Returns the
+/// papers that passed plus the number of records skipped. Pure/blocking — meant
+/// to run on a `spawn_blocking` thread so many files parse in parallel.
+fn parse_gz_file(path: &Path, min_year: u32, topic_filter: &TopicFilter) -> Result<(Vec<Paper>, usize)> {
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(GzDecoder::new(file));
+
+    let mut papers = Vec::new();
+    let mut skipped = 0usize;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let work: Work = match serde_json::from_str(&line) {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
+
+        // Filter: must have an abstract.
+        if work.abstract_inverted_index.is_none() {
+            skipped += 1;
+            continue;
+        }
+        // Filter: publication year.
+        if work.publication_year.map_or(true, |y| y < min_year) {
+            skipped += 1;
+            continue;
+        }
+        // Filter: must match the selected field/subfield(s).
+        if !matches_topic_filter(work.topics.as_deref().unwrap_or(&[]), topic_filter) {
+            skipped += 1;
+            continue;
+        }
+
+        match paper_from_work(&work, true) {
+            Some(p) => papers.push(p),
+            None => skipped += 1,
         }
     }
-    false
+
+    Ok((papers, skipped))
 }
 
 /// Ingest papers from an OpenAlex snapshot directory.
 /// Expects the directory structure: <snapshot_dir>/data/works/updated_date=*/part_*.gz
+///
+/// Pipelined: a pool of blocking workers decompress+parse `.gz` files in
+/// parallel (CPU), the main task batches and embeds (GPU), and a writer task
+/// inserts into Postgres (DB) — so all three stages overlap instead of running
+/// strictly one-after-another.
 pub async fn ingest_snapshot(
     snapshot_dir: &str,
     min_year: u32,
@@ -230,7 +372,7 @@ pub async fn ingest_snapshot(
     let db = DbClient::new().await.context("Database connection required for ingestion")?;
 
     // Collect all .gz files
-    let mut gz_files: Vec<_> = Vec::new();
+    let mut gz_files: Vec<PathBuf> = Vec::new();
     for entry in fs::read_dir(&works_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -247,138 +389,92 @@ pub async fn ingest_snapshot(
     }
 
     gz_files.sort();
-    eprintln!("Found {} compressed files to process", gz_files.len());
+    let num_files = gz_files.len();
+    eprintln!("Found {} compressed files to process", num_files);
 
     let total_ingested = Arc::new(AtomicUsize::new(0));
-    let total_skipped = Arc::new(AtomicUsize::new(0));
     let total_errors = Arc::new(AtomicUsize::new(0));
+    let mut total_skipped: usize = 0;
+    let mut dispatched: usize = 0;
     let start_time = Instant::now();
 
-    let pb = ProgressBar::new(gz_files.len() as u64);
+    let pb = ProgressBar::new(num_files as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}] {bar:40} {pos}/{len} files | {msg}")
             .unwrap()
     );
 
-    for gz_path in &gz_files {
-        let file_start = Instant::now();
-        let mut file_papers: Vec<Paper> = Vec::new();
-
-        // Read and parse the gzipped JSONL file
-        let file = fs::File::open(gz_path)?;
-        let decoder = GzDecoder::new(file);
-        let reader = BufReader::new(decoder);
-
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-
-            let work: serde_json::Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            // Filter: must have abstract
-            let abstract_inverted_index = work.get("abstract_inverted_index");
-            if abstract_inverted_index.is_none() || abstract_inverted_index == Some(&serde_json::Value::Null) {
-                total_skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-
-            // Filter: publication year
-            let year = work.get("publication_year")
-                .and_then(|y| y.as_u64())
-                .map(|y| y as u32);
-            if year.map(|y| y < min_year).unwrap_or(true) {
-                total_skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-
-            // Filter: must match the selected field/subfield(s)
-            if !matches_topic_filter(&work, topic_filter) {
-                total_skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-
-            // Filter: must have a title
-            let title = match work.get("title").and_then(|t| t.as_str()) {
-                Some(t) if !t.is_empty() => t.to_string(),
-                _ => {
-                    total_skipped.fetch_add(1, Ordering::Relaxed);
-                    continue;
+    // Writer task: inserts arrive over a bounded channel so DB writes overlap
+    // with the next batch's embedding. Bound is small so we apply backpressure
+    // instead of buffering unbounded papers in memory.
+    let (ins_tx, mut ins_rx) =
+        tokio::sync::mpsc::channel::<(Vec<Paper>, Vec<Vec<f32>>)>(2);
+    let writer = {
+        let db = db.clone();
+        let ingested = total_ingested.clone();
+        let errors = total_errors.clone();
+        tokio::spawn(async move {
+            while let Some((papers, embeddings)) = ins_rx.recv().await {
+                match db.insert_papers_batch(&papers, &embeddings).await {
+                    Ok(_) => {
+                        ingested.fetch_add(papers.len(), Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Batch DB insert error: {}", e);
+                        errors.fetch_add(papers.len(), Ordering::Relaxed);
+                    }
                 }
-            };
-
-            // Reconstruct abstract
-            let abstract_text = reconstruct_abstract(abstract_inverted_index);
-            if abstract_text.is_empty() {
-                total_skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
             }
+        })
+    };
 
-            // Extract metadata
-            let openalex_id = work.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-            let short_id = openalex_id.split('/').last().unwrap_or(&openalex_id).to_string();
+    // Parse stage: up to `parse_concurrency` files decompressed+parsed at once.
+    let parse_concurrency = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let topic_filter = Arc::new(topic_filter.clone());
+    let mut parsed = stream::iter(gz_files)
+        .map(|path| {
+            let tf = topic_filter.clone();
+            tokio::task::spawn_blocking(move || parse_gz_file(&path, min_year, &tf))
+        })
+        .buffer_unordered(parse_concurrency);
 
-            let doi = work.get("doi")
-                .and_then(|d| d.as_str())
-                .map(|s| s.replace("https://doi.org/", ""));
+    let mut buffer: Vec<Paper> = Vec::new();
+    let mut reached_cap = false;
 
-            let authors: Vec<String> = work.get("authorships")
-                .and_then(|a| a.as_array())
-                .map(|arr| arr.iter()
-                    .filter_map(|a| a.get("author")
-                        .and_then(|au| au.get("display_name"))
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_string()))
-                    .collect())
-                .unwrap_or_default();
-
-            let pdf_url = extract_pdf_url(&work);
-
-            file_papers.push(Paper {
-                id: format!("openalex:{}", short_id),
-                title,
-                abstract_text,
-                content: None,
-                source: PaperSource::OpenAlex,
-                year,
-                doi,
-                url: Some(openalex_id),
-                pdf_url,
-                authors,
-            });
+    'outer: while let Some(joined) = parsed.next().await {
+        match joined {
+            Ok(Ok((papers, skipped))) => {
+                total_skipped += skipped;
+                buffer.extend(papers);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("file parse error: {:#}", e);
+            }
+            Err(e) => {
+                tracing::warn!("parse task join error: {}", e);
+            }
         }
+        pb.inc(1);
 
-        // Embed and insert in batches
-        for batch in file_papers.chunks(batch_size) {
-            // Check if we've hit the max papers limit
+        while buffer.len() >= batch_size {
             if let Some(max) = max_papers {
-                if total_ingested.load(Ordering::Relaxed) >= max {
-                    pb.finish_with_message("Reached max papers limit");
-                    break;
+                if dispatched >= max {
+                    reached_cap = true;
+                    break 'outer;
                 }
             }
-            // Prepare texts for batch embedding
+            let batch: Vec<Paper> = buffer.drain(..batch_size).collect();
             let texts: Vec<String> = batch.iter()
                 .map(|p| format!("{} {}", p.title, p.abstract_text))
                 .collect();
 
-            // Batch embed
             match generate_document_embeddings_batch(texts).await {
                 Ok(embeddings) => {
-                    // Batch insert into DB
-                    match db.insert_papers_batch(batch, &embeddings).await {
-                        Ok(_) => {
-                            total_ingested.fetch_add(batch.len(), Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Batch DB insert error: {}", e);
-                            total_errors.fetch_add(batch.len(), Ordering::Relaxed);
-                        }
+                    dispatched += batch.len();
+                    if ins_tx.send((batch, embeddings)).await.is_err() {
+                        // Writer task is gone — nothing more we can do.
+                        break 'outer;
                     }
                 }
                 Err(e) => {
@@ -388,25 +484,45 @@ pub async fn ingest_snapshot(
             }
 
             let ingested = total_ingested.load(Ordering::Relaxed);
-            let skipped = total_skipped.load(Ordering::Relaxed);
             let errors = total_errors.load(Ordering::Relaxed);
             let elapsed = start_time.elapsed().as_secs_f64();
             let rate = if elapsed > 0.0 { ingested as f64 / elapsed } else { 0.0 };
-
             pb.set_message(format!(
                 "{} ingested, {} skipped, {} errors | {:.1}/s | ETA: {:.1}h for 2M",
-                ingested, skipped, errors, rate,
+                ingested, total_skipped, errors, rate,
                 if rate > 0.0 { (2_000_000.0 - ingested as f64) / rate / 3600.0 } else { 0.0 }
             ));
         }
-
-        pb.inc(1);
     }
+
+    // Flush the final partial batch (respecting the cap).
+    if !reached_cap && !buffer.is_empty() {
+        let remaining = max_papers.map_or(usize::MAX, |max| max.saturating_sub(dispatched));
+        let take = buffer.len().min(remaining);
+        if take > 0 {
+            let batch: Vec<Paper> = buffer.drain(..take).collect();
+            let texts: Vec<String> = batch.iter()
+                .map(|p| format!("{} {}", p.title, p.abstract_text))
+                .collect();
+            match generate_document_embeddings_batch(texts).await {
+                Ok(embeddings) => {
+                    let _ = ins_tx.send((batch, embeddings)).await;
+                }
+                Err(e) => {
+                    tracing::warn!("Batch embedding error: {}", e);
+                    total_errors.fetch_add(batch.len(), Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    // Signal the writer there's no more work and wait for outstanding inserts.
+    drop(ins_tx);
+    let _ = writer.await;
 
     pb.finish_with_message("Done!");
 
     let ingested = total_ingested.load(Ordering::Relaxed);
-    let skipped = total_skipped.load(Ordering::Relaxed);
     let errors = total_errors.load(Ordering::Relaxed);
     let elapsed = start_time.elapsed();
 
@@ -414,7 +530,7 @@ pub async fn ingest_snapshot(
     eprintln!("  INGESTION COMPLETE");
     eprintln!("{}", "=".repeat(60));
     eprintln!("  Papers ingested:  {}", ingested);
-    eprintln!("  Papers skipped:   {}", skipped);
+    eprintln!("  Papers skipped:   {}", total_skipped);
     eprintln!("  Errors:           {}", errors);
     eprintln!("  Total time:       {:.1?}", elapsed);
     eprintln!("  Rate:             {:.1} papers/sec", ingested as f64 / elapsed.as_secs_f64());
@@ -423,10 +539,93 @@ pub async fn ingest_snapshot(
     Ok(())
 }
 
+/// Fetch one page of the OpenAlex `/works` API, retrying forever with backoff on
+/// transport errors, 429s (honoring `Retry-After`) and decode failures. Returns
+/// the parsed page once it succeeds.
+async fn fetch_page(
+    client: &reqwest::Client,
+    base_url: &str,
+    cursor: &str,
+    pb: &ProgressBar,
+) -> Result<ApiResponse> {
+    let url = format!("{}&cursor={}", base_url, cursor);
+    let mut backoff: u32 = 0;
+
+    loop {
+        let res = match client
+            .get(&url)
+            .header("User-Agent", "autoresearch-lab/0.1 (research tool)")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let delay = retry_delay(backoff);
+                backoff = backoff.saturating_add(1);
+                pb.println(format!(
+                    "API request failed (attempt {}): {:#}. Retrying in {}s...",
+                    backoff, e, delay
+                ));
+                tracing::warn!(attempt = backoff, delay_s = delay, error = ?e, "API request failed, retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                continue;
+            }
+        };
+
+        if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = res.headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            let delay = retry_after.unwrap_or_else(|| retry_delay(backoff));
+            backoff = backoff.saturating_add(1);
+            let suffix = if retry_after.is_some() { " (from Retry-After)" } else { "" };
+            pb.println(format!(
+                "Rate limited (429, attempt {}). Waiting {}s{}...",
+                backoff, delay, suffix
+            ));
+            tracing::warn!(attempt = backoff, delay_s = delay, retry_after = ?retry_after, "429 rate-limited");
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            continue;
+        }
+
+        match res.error_for_status() {
+            Ok(r) => match r.json::<ApiResponse>().await {
+                Ok(body) => return Ok(body),
+                Err(e) => {
+                    let delay = retry_delay(backoff);
+                    backoff = backoff.saturating_add(1);
+                    pb.println(format!(
+                        "API JSON decode failed (attempt {}): {:#}. Retrying in {}s...",
+                        backoff, e, delay
+                    ));
+                    tracing::warn!(attempt = backoff, delay_s = delay, error = ?e, "JSON decode failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
+            },
+            Err(e) => {
+                let delay = retry_delay(backoff);
+                backoff = backoff.saturating_add(1);
+                pb.println(format!(
+                    "API HTTP error (attempt {}): {:#}. Retrying in {}s...",
+                    backoff, e, delay
+                ));
+                tracing::warn!(attempt = backoff, delay_s = delay, error = ?e, "HTTP error");
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                continue;
+            }
+        }
+    }
+}
+
 /// Ingest papers via the OpenAlex API with cursor-based pagination.
 /// `topics_filter` is a fully-formed OpenAlex filter clause like
 /// `"topics.field.id:17"` or `"topics.subfield.id:1702|1707"` — built by the caller
 /// (see `openalex_taxonomy::Taxonomy` for name-to-ID resolution).
+///
+/// The next page is prefetched concurrently while the current page is embedded
+/// and inserted, so network latency overlaps GPU + DB work.
 pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usize>, topics_filter: &str) -> Result<()> {
     let db = DbClient::new().await.context("Database connection required for ingestion")?;
     let client = reqwest::Client::new();
@@ -441,7 +640,6 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
         "Starting OpenAlex API ingest"
     );
 
-    let mut cursor = "*".to_string();
     let mut total_ingested: usize = 0;
     let mut total_skipped: usize = 0;
     let mut total_errors: usize = 0;
@@ -472,7 +670,8 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
         tracing::info!("OPENALEX_EMAIL not set — using public pool. Set it for priority queue + higher effective throughput.");
     }
 
-    let mut backoff_attempts: u32 = 0;
+    // Fetch the first page up front; subsequent pages are prefetched below.
+    let mut current = fetch_page(&client, &base_url, "*", &pb).await?;
 
     loop {
         if let Some(cap) = max_papers {
@@ -481,85 +680,10 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
             }
         }
 
-        let url = format!("{}&cursor={}", base_url, cursor);
-
-        let res = match client
-            .get(&url)
-            .header("User-Agent", "autoresearch-lab/0.1 (research tool)")
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let delay = retry_delay(backoff_attempts);
-                backoff_attempts = backoff_attempts.saturating_add(1);
-                let msg = format!(
-                    "API request failed (attempt {}): {:#}. Retrying in {}s...",
-                    backoff_attempts, e, delay
-                );
-                pb.println(&msg);
-                tracing::warn!(attempt = backoff_attempts, delay_s = delay, error = ?e, "API request failed, retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                continue;
-            }
-        };
-
-        if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = res.headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
-            let delay = retry_after.unwrap_or_else(|| retry_delay(backoff_attempts));
-            backoff_attempts = backoff_attempts.saturating_add(1);
-            let suffix = if retry_after.is_some() { " (from Retry-After)" } else { "" };
-            pb.println(format!(
-                "Rate limited (429, attempt {}). Waiting {}s{}...",
-                backoff_attempts, delay, suffix
-            ));
-            tracing::warn!(attempt = backoff_attempts, delay_s = delay, retry_after = ?retry_after, "429 rate-limited");
-            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-            continue;
-        }
-
-        let body: serde_json::Value = match res.error_for_status() {
-            Ok(r) => match r.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    let delay = retry_delay(backoff_attempts);
-                    backoff_attempts = backoff_attempts.saturating_add(1);
-                    pb.println(format!(
-                        "API JSON decode failed (attempt {}): {:#}. Retrying in {}s...",
-                        backoff_attempts, e, delay
-                    ));
-                    tracing::warn!(attempt = backoff_attempts, delay_s = delay, error = ?e, "JSON decode failed");
-                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                    continue;
-                }
-            },
-            Err(e) => {
-                let delay = retry_delay(backoff_attempts);
-                backoff_attempts = backoff_attempts.saturating_add(1);
-                pb.println(format!(
-                    "API HTTP error (attempt {}): {:#}. Retrying in {}s...",
-                    backoff_attempts, e, delay
-                ));
-                tracing::warn!(attempt = backoff_attempts, delay_s = delay, error = ?e, "HTTP error");
-                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                continue;
-            }
-        };
-
-        // Request succeeded — reset backoff.
-        backoff_attempts = 0;
-
         // On the first successful response, report OpenAlex's actual total matching count
         // and size the progress bar to it (or to the user-imposed max_papers cap, whichever is smaller).
         if !meta_count_logged {
-            if let Some(count) = body
-                .get("meta")
-                .and_then(|m| m.get("count"))
-                .and_then(|c| c.as_u64())
-            {
+            if let Some(count) = current.meta.as_ref().and_then(|m| m.count) {
                 let target = match max_papers {
                     Some(cap) => (cap as u64).min(count),
                     None => count,
@@ -574,67 +698,41 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
             meta_count_logged = true;
         }
 
-        // Get next cursor
-        let next_cursor = body.get("meta")
-            .and_then(|m| m.get("next_cursor"))
-            .and_then(|c| c.as_str())
-            .map(|s| s.to_string());
-
-        let results = match body.get("results").and_then(|r| r.as_array()) {
-            Some(r) => r,
-            None => break,
-        };
-
-        if results.is_empty() {
+        if current.results.is_empty() {
             break;
         }
 
-        // Parse papers from this page
-        let mut page_papers: Vec<Paper> = Vec::new();
-        for item in results {
-            let title = match item.get("title").and_then(|t| t.as_str()) {
-                Some(t) if !t.is_empty() => t.to_string(),
-                _ => { total_skipped += 1; continue; }
-            };
+        let next_cursor = current.meta.as_ref().and_then(|m| m.next_cursor.clone());
 
-            let abstract_text = reconstruct_abstract(item.get("abstract_inverted_index"));
-            if abstract_text.is_empty() {
-                total_skipped += 1;
-                continue;
+        // Kick off the next page fetch now so the network round-trip overlaps the
+        // embed + insert work below. Skip if we're at/over the cap or out of pages.
+        let under_cap = max_papers.map_or(true, |cap| total_ingested < cap);
+        let prefetch = match &next_cursor {
+            Some(c) if !c.is_empty() && under_cap => {
+                let client = client.clone();
+                let base_url = base_url.clone();
+                let cursor = c.clone();
+                let pb = pb.clone();
+                Some(tokio::spawn(async move { fetch_page(&client, &base_url, &cursor, &pb).await }))
             }
+            _ => None,
+        };
 
-            let openalex_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-            let short_id = openalex_id.split('/').last().unwrap_or(&openalex_id).to_string();
-            let year = item.get("publication_year").and_then(|y| y.as_u64()).map(|y| y as u32);
-            let doi = item.get("doi").and_then(|d| d.as_str())
-                .map(|s| s.replace("https://doi.org/", ""));
-            let authors: Vec<String> = item.get("authorships")
-                .and_then(|a| a.as_array())
-                .map(|arr| arr.iter()
-                    .filter_map(|a| a.get("author")
-                        .and_then(|au| au.get("display_name"))
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_string()))
-                    .collect())
-                .unwrap_or_default();
-
-            let pdf_url = extract_pdf_url(item);
-
-            page_papers.push(Paper {
-                id: format!("openalex:{}", short_id),
-                title,
-                abstract_text,
-                content: None,
-                source: PaperSource::OpenAlex,
-                year,
-                doi,
-                url: Some(openalex_id),
-                pdf_url,
-                authors,
-            });
+        // Parse papers from this page. Each record is decoded into `Work`
+        // independently so one malformed work is skipped, not fatal.
+        let results = std::mem::take(&mut current.results);
+        let mut page_papers: Vec<Paper> = Vec::with_capacity(results.len());
+        for item in results {
+            match serde_json::from_value::<Work>(item) {
+                Ok(work) => match paper_from_work(&work, true) {
+                    Some(p) => page_papers.push(p),
+                    None => total_skipped += 1,
+                },
+                Err(_) => total_skipped += 1,
+            }
         }
 
-        // Embed and insert in batches
+        // Embed and insert in batches.
         for batch in page_papers.chunks(batch_size) {
             if let Some(cap) = max_papers {
                 if total_ingested >= cap {
@@ -720,9 +818,15 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
             ));
         }
 
-        // Advance cursor
-        match next_cursor {
-            Some(c) => cursor = c,
+        // Advance to the prefetched page, or stop if there wasn't one.
+        match prefetch {
+            Some(handle) => {
+                current = match handle.await {
+                    Ok(Ok(body)) => body,
+                    Ok(Err(e)) => return Err(e),
+                    Err(join_err) => anyhow::bail!("page prefetch task failed: {}", join_err),
+                };
+            }
             None => break,
         }
     }
@@ -755,25 +859,25 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
     Ok(())
 }
 
-/// Reconstruct abstract from OpenAlex's inverted index format.
-fn reconstruct_abstract(inverted_index: Option<&serde_json::Value>) -> String {
-    let index = match inverted_index.and_then(|v| v.as_object()) {
-        Some(obj) => obj,
-        None => return String::new(),
-    };
-
-    let mut positions: Vec<(usize, &str)> = Vec::new();
-
-    for (word, pos_array) in index {
-        if let Some(arr) = pos_array.as_array() {
-            for pos in arr {
-                if let Some(p) = pos.as_u64() {
-                    positions.push((p as usize, word.as_str()));
-                }
-            }
+/// Reconstruct an abstract from OpenAlex's inverted-index format
+/// (`{word: [positions...]}`) into plain text.
+fn reconstruct_abstract(index: &HashMap<String, Vec<u32>>) -> String {
+    let mut positions: Vec<(u32, &str)> = Vec::new();
+    for (word, posns) in index {
+        for &p in posns {
+            positions.push((p, word.as_str()));
         }
     }
 
     positions.sort_by_key(|(pos, _)| *pos);
-    positions.iter().map(|(_, word)| *word).collect::<Vec<_>>().join(" ")
+
+    // Build the string directly instead of collecting an intermediate Vec<&str>.
+    let mut out = String::with_capacity(positions.iter().map(|(_, w)| w.len() + 1).sum());
+    for (i, (_, word)) in positions.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
 }

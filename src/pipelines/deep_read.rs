@@ -12,7 +12,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 
 use crate::storage::postgres::DbClient;
@@ -84,13 +84,19 @@ fn sanitize_id(id: &str) -> String {
         .collect()
 }
 
-/// Stream a PDF to disk. Times out at 60s, follows redirects.
-async fn download_pdf(url: &str, dest: &Path) -> Result<()> {
-    let client = reqwest::Client::builder()
+/// Shared client for PDF downloads — built once and reused (vs. a fresh client
+/// per call). 60s timeout for potentially-large PDFs; follows redirects.
+static PDF_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .user_agent("autoresearch-lab/0.1 (research tool)")
-        .build()?;
-    let bytes = client.get(url).send().await?.error_for_status()?.bytes().await?;
+        .build()
+        .expect("failed to build PDF download client")
+});
+
+/// Stream a PDF to disk. Times out at 60s, follows redirects.
+async fn download_pdf(url: &str, dest: &Path) -> Result<()> {
+    let bytes = PDF_HTTP.get(url).send().await?.error_for_status()?.bytes().await?;
     if bytes.is_empty() {
         anyhow::bail!("downloaded 0 bytes from {}", url);
     }
@@ -220,15 +226,21 @@ pub async fn read_paper(paper_id: &str) -> Result<String> {
 
     let parser = detect_parser();
 
-    let parse_result: Result<String> = (async {
+    let parse_result: Result<String> = async {
         download_pdf(&pdf_url, &pdf_path)
             .await
             .with_context(|| format!("downloading {}", pdf_url))?;
-        match parser {
+        // The parsers shell out and block (marker can run for minutes) — run them
+        // on a blocking thread so they don't stall the async executor.
+        let pdf_path = pdf_path.clone();
+        let temp_dir = temp_dir.clone();
+        tokio::task::spawn_blocking(move || match parser {
             Parser::Pdftotext => run_pdftotext(&pdf_path),
             Parser::Marker => run_marker(&pdf_path, &temp_dir),
-        }
-    })
+        })
+        .await
+        .context("PDF parser task panicked")?
+    }
     .await;
 
     let _ = std::fs::remove_dir_all(&temp_dir);

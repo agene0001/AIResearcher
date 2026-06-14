@@ -1,5 +1,5 @@
 use anyhow::Result;
-use reqwest::Client;
+use crate::retrieval::HTTP;
 use roxmltree::Document;
 use crate::models::paper::{Paper, PaperSource};
 
@@ -10,7 +10,7 @@ pub async fn search_arxiv(query: &str, max_results: usize) -> Result<Vec<Paper>>
         formatted_query, max_results
     );
 
-    let client = Client::new();
+    let client = &*HTTP;
     let xml_res = client.get(&url).send().await?.text().await?;
 
     let mut papers = Vec::new();

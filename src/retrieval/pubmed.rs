@@ -1,10 +1,10 @@
 use anyhow::Result;
-use reqwest::Client;
+use crate::retrieval::HTTP;
 use crate::models::paper::{Paper, PaperSource};
 
 /// Search PubMed via the NCBI E-utilities API (free, no key required for moderate use).
 pub async fn search_pubmed(query: &str, max_results: usize) -> Result<Vec<Paper>> {
-    let client = Client::new();
+    let client = &*HTTP;
     let limit = max_results.min(50);
 
     // Step 1: Search for IDs
