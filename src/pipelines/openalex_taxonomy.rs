@@ -59,16 +59,22 @@ impl Taxonomy {
 async fn fetch_all(client: &reqwest::Client, base_url: &str) -> Result<Vec<(u32, String)>> {
     let mut out = Vec::new();
     let mut cursor = "*".to_string();
-    let mailto_qs = std::env::var("OPENALEX_EMAIL")
-        .ok()
-        .filter(|e| !e.is_empty())
-        .map(|e| format!("&mailto={}", e))
-        .unwrap_or_default();
+    let mut auth_qs = String::new();
+    if let Ok(key) = std::env::var("OPENALEX_API_KEY") {
+        if !key.is_empty() {
+            auth_qs.push_str(&format!("&api_key={}", key));
+        }
+    }
+    if let Ok(email) = std::env::var("OPENALEX_EMAIL") {
+        if !email.is_empty() {
+            auth_qs.push_str(&format!("&mailto={}", email));
+        }
+    }
 
     loop {
         let url = format!(
             "{}?per_page=200&cursor={}{}",
-            base_url, cursor, mailto_qs,
+            base_url, cursor, auth_qs,
         );
         let page: Page = fetch_page_with_retry(client, &url).await?;
         for e in page.results {

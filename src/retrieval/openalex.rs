@@ -22,9 +22,15 @@ pub async fn search_openalex(query: &str, max_results: usize) -> Result<Vec<Pape
         per_page,
     );
 
-    // Polite pool: add mailto for better rate limits
     if let Ok(email) = std::env::var("OPENALEX_EMAIL") {
-        url.push_str(&format!("&mailto={}", email));
+        if !email.is_empty() {
+            url.push_str(&format!("&mailto={}", email));
+        }
+    }
+    if let Ok(key) = std::env::var("OPENALEX_API_KEY") {
+        if !key.is_empty() {
+            url.push_str(&format!("&api_key={}", key));
+        }
     }
 
     let res: SearchResponse = client

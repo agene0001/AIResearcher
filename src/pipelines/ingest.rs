@@ -662,12 +662,20 @@ pub async fn ingest_api(min_year: u32, batch_size: usize, max_papers: Option<usi
         per_page,
     );
 
-    // Use polite pool if email is set
+    // Polite pool (mailto) + API key ($1/day budget vs $0.10/day without key).
     if let Ok(email) = std::env::var("OPENALEX_EMAIL") {
-        base_url.push_str(&format!("&mailto={}", email));
-        tracing::info!(email = %email, "Using OpenAlex polite pool");
+        if !email.is_empty() {
+            base_url.push_str(&format!("&mailto={}", email));
+            tracing::info!(email = %email, "Using OpenAlex polite pool");
+        }
     } else {
         tracing::info!("OPENALEX_EMAIL not set — using public pool. Set it for priority queue + higher effective throughput.");
+    }
+    if let Ok(key) = std::env::var("OPENALEX_API_KEY") {
+        if !key.is_empty() {
+            base_url.push_str(&format!("&api_key={}", key));
+            tracing::info!("Using OpenAlex API key");
+        }
     }
 
     // Fetch the first page up front; subsequent pages are prefetched below.
